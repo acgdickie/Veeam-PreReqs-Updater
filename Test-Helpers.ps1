@@ -92,6 +92,9 @@ $scriptText = Get-Content -LiteralPath $script:Path -Raw
 Check 'EM needs service or files'       ($scriptText -match 'emServices\.Count -gt 0 -or \$emPaths\.Count -gt 0') 'True'
 Check 'stale EM key is not a product'   ($scriptText -match 'StaleEnterpriseManagerKey = \$emKey') 'True'
 Check 'EM removal needs proven stale'   ($scriptText -match 'if \(-not \$script:StaleEnterpriseManagerKey\)') 'True'
+# Enterprise Manager beside VBR is supported; the log must not call it excluded.
+Check 'EM log line is not stale'        ($scriptText -match 'this topology is excluded until') 'False'
+Check 'EM log line names both cases'    ($scriptText -match 'Supported beside VBR: STEP 4 checks its configuration database' -and $scriptText -match 'supports Enterprise Manager only beside VBR') 'True'
 $workRootParameter = @($ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'WorkRoot' })[0]
 Check 'WorkRoot default is C:\ProgramData\VeeamPgUpdate' $workRootParameter.DefaultValue.Value 'C:\ProgramData\VeeamPgUpdate'
 $legacyFunction = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-TrustedLegacyRecoveryMarker' }, $true))[0]

@@ -426,6 +426,38 @@ details for the RMM; it never terminates those sessions.
 
 ## What the script does, step by step
 
+### In short
+
+1. **Checks it is safe to start.** Proves its work folder can be trusted, makes sure no
+   other copy is running, and checks the server: Windows, run as administrator, and not
+   part-way through an earlier run.
+2. **Finds out what is installed.** Which Veeam product (VBR or VB365), where its database
+   is (one local PostgreSQL), and which PostgreSQL version is running. Stops on any setup
+   it does not support.
+3. **Works out what is due.** The latest PostgreSQL minor release on the same major
+   version, and on VB365 a NATS update on the same line. **An audit stops here and
+   reports.**
+4. **Waits for Veeam to be quiet.** Lets running backups and restores finish. It never
+   stops one.
+5. **Downloads and checks the update.** The PostgreSQL installer must be signed by
+   EnterpriseDB. The NATS download must match its SHA256.
+6. **Turns off the jobs.** Records and disables every scheduled job, and on VB365 puts the
+   repositories into maintenance mode, so no new work starts.
+7. **Backs up.** The VBR configuration backup and a dump of every Veeam database, then,
+   with the services stopped, a full copy of PostgreSQL's data folder. For NATS: its
+   service settings, config file and message store.
+8. **Updates.** Stops the Veeam services and installs the PostgreSQL update, or switches
+   NATS to the new version. One change per run: PostgreSQL first, NATS on the next run.
+9. **Checks it worked.** Confirms the new version, applies Veeam's PostgreSQL tuning, and
+   starts the Veeam services again.
+10. **Turns the jobs back on** and reports the result for the RMM. After a PostgreSQL
+    update the server needs a restart, by the RMM or with `-Reboot`.
+
+If anything fails before the update itself, the script puts everything back the way it
+was. If a run is interrupted, `-Recover` finishes it or puts it back.
+
+### In detail
+
 Every run writes each step to its log under the name in the first column, so you can match
 a log to this list.
 
@@ -1022,6 +1054,18 @@ All notable changes, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The project has no version
 numbers, so each entry is the date the change reached GitHub, with its commit IDs. When
 you change a script, add your entry at the top.
+
+### 2026-10-20
+
+#### Added
+
+* README: [In short](#in-short), a ten-line summary of the steps at the top of
+  [What the script does, step by step](#what-the-script-does-step-by-step).
+
+#### Fixed
+
+* The log line for Enterprise Manager beside VBR said that setup was "excluded". It now
+  says it is supported, and says when it is not: Enterprise Manager without VBR.
 
 ### 2026-10-15
 

@@ -5029,7 +5029,12 @@ if (Test-Path $emKey) {
         $emEvidence = @()
         if ($emServices.Count -gt 0) { $emEvidence += "service(s): $(@($emServices | ForEach-Object { $_.Name }) -join ', ')" }
         if ($emPaths.Count -gt 0)    { $emEvidence += "path(s): $(@($emPaths | Select-Object -Unique) -join ', ')" }
-        Write-Log "Found Veeam Backup Enterprise Manager ($($emEvidence -join '; ')); this topology is excluded until its separate configuration database is supported" WARN
+        # VBR is detected above, so this can already say which case applies.
+        if (@($products | Where-Object { $_.Name -eq 'VBR' }).Count -gt 0) {
+            Write-Log "Found Veeam Backup Enterprise Manager ($($emEvidence -join '; ')). Supported beside VBR: STEP 4 checks its configuration database, and its services are stopped and restarted with the other Veeam services." OK
+        } else {
+            Write-Log "Found Veeam Backup Enterprise Manager ($($emEvidence -join '; ')) without VBR. This script supports Enterprise Manager only beside VBR, so it will not update this server." WARN
+        }
     } else {
         $script:StaleEnterpriseManagerKey = $emKey
         $script:Report.StaleEmRecord = 'present'
