@@ -58,7 +58,7 @@ $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
         'Get-FileSha256','Get-NatsDiscovery','Set-NatsStage','Set-NatsServicePath','Stop-ServiceAndWait','Test-NatsRunningAt',
         'Restore-NatsStore','Restore-NatsInstallation','Get-NatsManualRevertAction','Stop-ServicesInOrder','Get-NatsRunFacts',
         'Invoke-NatsWebText','ConvertFrom-VeeamNatsRequirementsHtml','Get-NatsSupportedVersions','ConvertFrom-NatsSha256Sums','Resolve-NatsPackageSha256',
-        'Get-MarkerForSummary','Get-BlockedRunNote',
+        'Get-MarkerForSummary','Get-BlockedRunNote','Get-VeeamOneEvidence',
         'Get-WshSettingsKeys','Test-WshSettingsKey','Get-WshDisabledValues','Get-WshWriteProblems','Enable-WshForInstaller','Restore-WshSettings','Get-WshRestorePending','Restore-WshForRun','Get-WshManualRestoreAction'
 foreach ($fn in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
     if ($want -contains $fn.Name) { . ([scriptblock]::Create($fn.Extent.Text)) }
@@ -3318,6 +3318,19 @@ $r2 = Invoke-Native 'cmd.exe' @('/c','echo hello')
 Check 'clean run exit 0'     $r2.ExitCode 0
 Check 'clean run stdout'     $r2.StdOut 'hello'
 Check 'clean run no stderr'  $r2.StdErr ''
+
+'--- Veeam ONE: a leftover registry key alone is not an installation ---'
+$voneService = [pscustomobject]@{ ServiceName = 'VeeamDCS'; DisplayName = 'Veeam ONE Monitoring Service' }
+$voneOther = [pscustomobject]@{ ServiceName = 'VeeamDeploySvc'; DisplayName = 'Veeam Installer Service' }
+Check 'Veeam ONE: its service is a sign'      ((@(Get-VeeamOneEvidence -Services @($voneOther, $voneService)) -join '; ') -match 'service VeeamDCS \(Veeam ONE Monitoring Service\)') 'True'
+Check 'Veeam ONE: other Veeam services are not' @(Get-VeeamOneEvidence -Services @($voneOther)).Count 0
+Check 'Veeam ONE: the real lists read cleanly here' ((Throws { Get-VeeamOneEvidence }) -eq $false -and @(Get-VeeamOneEvidence).Count -eq 0) 'True'
+Check 'Veeam ONE: an unreadable service list fails closed' ((@(Get-VeeamOneEvidence -Services @([pscustomobject]@{ Name = 'x' })) -join '; ') -match 'service list could not be read') 'True'
+$voneStep3 = $scriptText.Substring($scriptText.IndexOf('# --- Veeam ONE (co-residence hazard, not a target) ---'))
+$voneStep3 = $voneStep3.Substring(0, $voneStep3.IndexOf('# --- Enterprise Manager'))
+Check 'Veeam ONE: STEP 3 needs a sign besides the key' ($voneStep3 -match '(?s)\$veeamOneEvidence = @\(Get-VeeamOneEvidence\)\s+if \(\$veeamOneEvidence\.Count -gt 0\) \{\s+\$products \+= \[pscustomobject\]@\{ Name=''VeeamONE''') 'True'
+Check 'Veeam ONE: a key alone is reported as leftover' ($voneStep3 -match 'Treating it as a leftover record from an uninstall') 'True'
+Check 'Veeam ONE: no Get-Service listing of every service' ($voneStep3 + @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Get-VeeamOneEvidence' }, $true))[0].Extent.Text -match '\(Get-Service|Get-Service\s+-|Get-Service\s*\|') 'False'
 
 '--- A run blocked by an earlier marker says only what it knows ---'
 & {

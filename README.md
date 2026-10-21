@@ -32,7 +32,9 @@ Should you follow the above procedure this can take alot of time and effort and 
   with a database the script cannot read, remote/distributed databases and proxies, and
   multiple or HA PostgreSQL instances return exit `11` for manual handling. A server with
   Enterprise Manager and neither VBR nor VB365 is not a target (exit `0`, `NOT_APPLICABLE`). See [Leftover Enterprise
-  Manager records](#leftover-enterprise-manager-records).
+  Manager records](#leftover-enterprise-manager-records). Veeam ONE counts as installed only
+  when its `HKLM:\SOFTWARE\Veeam\Veeam ONE` key has a Veeam ONE service or installed-programs
+  entry behind it; a key left by an uninstall is logged as a leftover and does not block.
 * **Windows only.** On the Veeam Linux appliance, PostgreSQL comes from Veeam Updater.
   Do not hand-patch those. The script refuses.
 * **Minor updates only, always to the latest release on the installed major.** The script
@@ -491,7 +493,7 @@ the RMM summary. See [Exit codes](#exit-codes) and [If it goes wrong](#if-it-goe
 |---|---|---|
 | STEP 1 - Load settings | Loads the settings built into the script, then purges logs and completed run folders older than `retentionDays`. It keeps unresolved runs and the two newest completed recovery sets. | Settings come only from the reviewed script. Without the purge, daily audits would fill the disk. |
 | STEP 2 - Context checks | Checks the switch combination, that the server runs Windows and is not a Veeam appliance, that the run is elevated, and that `-Install` is not over PowerShell remoting. A changes-in-progress marker sends `-Recover` to recovery and stops every other run (`PRIOR_RUN_INCOMPLETE`, exit `40`). `-Recover` with no marker ends here (`RECOVERY_NOT_NEEDED`, exit `0`). | Each of these breaks an unattended update. An interrupted run must be dealt with before a new one starts. |
-| STEP 3 - Detect Veeam products | Finds VBR, VB365, Veeam ONE and Enterprise Manager, and a leftover Enterprise Manager registry key (removing it with `-RemoveStaleEnterpriseManagerRecord`). Warns about Veeam services set to start automatically that are stopped. Refuses topologies outside the supported profile. | Decides which product profile applies, and stops early on a server the script does not support. |
+| STEP 3 - Detect Veeam products | Finds VBR, VB365, Veeam ONE (its registry key plus a Veeam ONE service or installed program; the key alone is a leftover) and Enterprise Manager, and a leftover Enterprise Manager registry key (removing it with `-RemoveStaleEnterpriseManagerRecord`). Warns about Veeam services set to start automatically that are stopped. Refuses topologies outside the supported profile. | Decides which product profile applies, and stops early on a server the script does not support. |
 | STEP 4 - Confirm database engine | Reads where each product keeps its database: VBR's active engine and connection from the registry, Enterprise Manager's database the same way, and VB365's `Config.xml` and `Proxy.xml`. All must be local PostgreSQL on one port. | Nothing is guessed. A remote database or two ports means the script cannot tell what it is updating. |
 | STEP 5 - Detect PostgreSQL installation | Requires exactly one PostgreSQL installation in the registry and one PostgreSQL Windows service, which must run `pg_ctl.exe` or `postgres.exe` from that installation. Checks that `psql`, `pg_dump`, `pg_dumpall` and `pg_restore` are there. | The installer must patch the instance Veeam really uses, and the backup tools must exist. |
 | STEP 6 - Read running server version | Requires PostgreSQL to be running and logs in as `postgres` (Windows SSPI), naming the cause if the login is refused. Reads the running version. Proves the data directory on Veeam's port is the registry's, keeps `WorkRoot` outside it, checks for a pooler or port mismatch, lists the databases, and refuses replication, standby or Windows Failover Clustering. | Proves the instance is the right one, standalone, and reachable, before anything else. |
@@ -1179,6 +1181,11 @@ you change a script, add your entry at the top.
 
 #### Fixed
 
+* A server where Veeam ONE had been uninstalled was refused as `VEEAM_ONE_PRESENT` (exit
+  `11`), because the uninstall left the `HKLM:\SOFTWARE\Veeam\Veeam ONE` key behind. Veeam
+  ONE now counts as installed only with a Veeam ONE service or installed-programs entry as
+  well. A key alone is logged as a leftover. If either list cannot be read, the server is
+  still refused, as before.
 * `-Recover` in a PowerShell the Veeam module cannot load in (for example Windows
   PowerShell 5.1 on VBR 13) could start the Veeam services and then fail to reach the jobs,
   leaving a run that `-Recover` then refused. It now checks the module first and changes

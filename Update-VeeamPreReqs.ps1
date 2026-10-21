@@ -3458,6 +3458,43 @@ function Get-FileVersionSafe {
     return $null
 }
 
+# Signs that Veeam ONE is really installed: a service whose display name starts with
+# 'Veeam ONE', or an installed-programs entry (64- or 32-bit) whose name does. An
+# uninstall removes both, but can leave HKLM:\SOFTWARE\Veeam\Veeam ONE behind.
+# Fails closed: if either list cannot be read, that counts as a sign, so the server is
+# treated as before. The services come from ServiceController, not Get-Service: listing
+# every service with Get-Service can fail part-way (and in PowerShell 7 stop the script).
+function Get-VeeamOneEvidence {
+    param([object[]] $Services = $null)
+    $evidence = @()
+    try {
+        if ($null -eq $Services) {
+            Add-Type -AssemblyName System.ServiceProcess -ErrorAction Stop
+            $Services = @([System.ServiceProcess.ServiceController]::GetServices())
+        }
+        foreach ($service in @($Services | Where-Object { "$($_.DisplayName)" -like 'Veeam ONE*' })) {
+            $evidence += "service $($service.ServiceName) ($($service.DisplayName))"
+        }
+    } catch {
+        $evidence += "the service list could not be read ($($_.Exception.Message))"
+    }
+    foreach ($view in @('Registry64', 'Registry32')) {
+        try {
+            $uninstall = [Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine', $view).OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
+            if (-not $uninstall) { continue }
+            foreach ($name in $uninstall.GetSubKeyNames()) {
+                $entry = $uninstall.OpenSubKey($name)
+                if (-not $entry) { continue }
+                $display = "$($entry.GetValue('DisplayName'))"
+                if ($display -like 'Veeam ONE*') { $evidence += "installed program '$display'" }
+            }
+        } catch {
+            $evidence += "the $view installed-programs list could not be read ($($_.Exception.Message))"
+        }
+    }
+    return @($evidence | Select-Object -Unique)
+}
+
 # Veeam modules must be loadable before we can prove anything about jobs.
 function Get-Vb365ModulePath {
     return 'C:\Program Files\Veeam\Backup365\Veeam.Archiver.PowerShell\Veeam.Archiver.PowerShell.psd1'
@@ -5373,9 +5410,18 @@ if ($vb365Svc -or (Test-Path $vb365Exe)) {
 }
 
 # --- Veeam ONE (co-residence hazard, not a target) ---
+# Its registry key can outlive an uninstall, so the key alone is not proof: Veeam ONE
+# counts as installed only with a Veeam ONE service or installed-programs entry as well.
+# A server without the key is treated as before; the only server now let through is one
+# whose key has no service and no installed program behind it.
 if (Test-Path 'HKLM:\SOFTWARE\Veeam\Veeam ONE') {
-    $products += [pscustomobject]@{ Name='VeeamONE'; Version=$null; CorePath=$null }
-    Write-Log 'Found Veeam ONE on this server' WARN
+    $veeamOneEvidence = @(Get-VeeamOneEvidence)
+    if ($veeamOneEvidence.Count -gt 0) {
+        $products += [pscustomobject]@{ Name='VeeamONE'; Version=$null; CorePath=$null }
+        Write-Log "Veeam ONE is treated as installed on this server: $(Format-ShortText ($veeamOneEvidence -join '; ') 300)" WARN
+    } else {
+        Write-Log 'HKLM:\SOFTWARE\Veeam\Veeam ONE exists, but no Veeam ONE service or installed program does. Treating it as a leftover record from an uninstall, not an installation.' WARN
+    }
 }
 
 # --- Enterprise Manager (has its own PostgreSQL-capable configuration DB) ---
