@@ -537,7 +537,7 @@ the RMM summary. See [Exit codes](#exit-codes) and [If it goes wrong](#if-it-goe
 
 | Step | What it does | Why |
 |---|---|---|
-| Recovery (from STEP 2) | Checks that the marker and its recovery state are the script's own and belong together. Then, depending on how far the run got: puts back captured job and service state (installer not started), finishes the run (installer finished and PostgreSQL proven healthy at the target version), puts the old NATS back or finishes a NATS update, or only reports (anything less certain). In every case, if the interrupted run left Windows Script Host turned on and the installer is no longer running, turns it off again. | Finishes or undoes an interrupted run from its own records, never by guessing. |
+| Recovery (from STEP 2) | Checks that the marker and its recovery state are the script's own and belong together, and that the Veeam module loads in this PowerShell before anything changes. Then, depending on how far the run got: puts back captured job and service state (installer not started), finishes the run (installer finished and PostgreSQL proven healthy at the target version), puts the old NATS back or finishes a NATS update, or only reports (anything less certain). In every case, if the interrupted run left Windows Script Host turned on and the installer is no longer running, turns it off again. | Finishes or undoes an interrupted run from its own records, never by guessing. |
 
 ### When a run ends
 
@@ -876,7 +876,28 @@ Read `ExitCode`, `Stage`, `IssueCode`, `ActionRequired`, `JobsLeftDisabled`,
 A run blocked by a leftover marker (`PRIOR_RUN_INCOMPLETE`), and a `-Recover` that refuses
 the marker or its recovery state, also report `Stage=INSTALLING` (a refused NATS recovery
 keeps the stage it recorded). Those runs changed nothing
-themselves; the server is as the earlier run left it. Read `Detail` and `ActionRequired`.
+themselves; the server is as the earlier run left it. A blocked run's `Detail` names the
+earlier run, its recorded stage, how many Veeam services run now, and the next step for that
+stage; `RecoveryRunDir` is the earlier run's folder (the blocked run creates none). The
+whole marker is in the log.
+
+**Closing out an earlier run by hand.** This is only for a PostgreSQL run whose marker
+stage is `VERIFIED` (PostgreSQL was already verified at its target) while the Veeam services
+already run: `-Recover` then only reports, because it cannot tell who started them. A NATS
+run's `VERIFIED` marker is different: `-Recover` finishes it. Then:
+
+1. Check that PostgreSQL reports the target version and that the Veeam services are healthy.
+2. On VB365: if `recovery-state.json` in `RecoveryRunDir` has a `Vb365MaintenanceSessionId`,
+   end that repository maintenance session (`Stop-VBORepositoryMaintenanceSession -Id <id>`)
+   and check the repositories have left maintenance mode.
+3. In the Veeam console, check every job listed in `disabled-jobs.json` in `RecoveryRunDir`,
+   and turn back on any that is still off. On VBR, run a configuration backup.
+4. Move `CHANGES-IN-PROGRESS.marker` into that run folder (for example as
+   `CHANGES-IN-PROGRESS.marker.closed-by-hand`), so it stays with the evidence.
+5. Run an audit.
+
+A marker that is moved away no longer protects that run's log from the clean-up described
+in [Where the evidence lives](#where-the-evidence-lives); copy the log first if you need it.
 
 **Exit 40, Stage=VERIFIED** (`VEEAM_TUNING_FAILED`, `SERVICES_UNHEALTHY_JOBS_DISABLED`,
 `VB365_MAINTENANCE_RELEASE_FAILED`, `FINAL_SESSION_CHECK_FAILED`, `FINAL_JOB_DRAIN_TIMEOUT` or
@@ -921,6 +942,10 @@ Use `-Recover` for an interrupted run:
 
 * It validates that the marker and versioned `recovery-state.json` resolve inside this
   work root and are trusted recovery data.
+* Before it changes anything, it checks that the Veeam PowerShell module loads in this
+  PowerShell (VBR 13 and VB365 need PowerShell 7). If it does not, a pre-installer or NATS
+  recovery stops with `RECOVERY_MODULE_UNAVAILABLE` (exit `40`) and changes nothing, and
+  finishing an installed run stays diagnostic-only. Run `-Recover` again in PowerShell 7.
 * For a NATS update run, see [Updating NATS (VB365)](#updating-nats-vb365).
 * If the recorded installer-started flag is false and the stage is `JOBS_DISABLED` or
   `SERVICES_STOPPED`, it restores and verifies captured PostgreSQL, NATS, Veeam service,
@@ -1149,6 +1174,21 @@ you change a script, add your entry at the top.
 * Outcome `WSH_ENABLE_FAILED` (exit `20`): Windows Script Host could not be turned on, so
   the installer never started and the run rolled back. Issue code `WSH_LEFT_ON` (exit `40`):
   it could not be turned off again.
+* README: [Closing out an earlier run by hand](#if-it-goes-wrong), for a `VERIFIED` marker
+  when the Veeam services already run.
+
+#### Fixed
+
+* `-Recover` in a PowerShell the Veeam module cannot load in (for example Windows
+  PowerShell 5.1 on VBR 13) could start the Veeam services and then fail to reach the jobs,
+  leaving a run that `-Recover` then refused. It now checks the module first and changes
+  nothing: `RECOVERY_MODULE_UNAVAILABLE` (exit `40`) for a pre-installer or NATS recovery,
+  and `RECOVERY_DIAGNOSTIC_ONLY` for finishing an installed run.
+* A run blocked by an earlier run's marker said "Veeam services are STOPPED and jobs are
+  DISABLED" and named a backup folder that does not exist. It never checked either. It now
+  names the earlier run (PostgreSQL or NATS), its stage and its folder (also in
+  `RecoveryRunDir`), counts the Veeam services running now, and gives the next step for
+  that stage. The whole marker goes to the log.
 
 ### 2026-10-20
 

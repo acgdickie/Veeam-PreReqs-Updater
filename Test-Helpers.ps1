@@ -58,11 +58,15 @@ $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
         'Get-FileSha256','Get-NatsDiscovery','Set-NatsStage','Set-NatsServicePath','Stop-ServiceAndWait','Test-NatsRunningAt',
         'Restore-NatsStore','Restore-NatsInstallation','Get-NatsManualRevertAction','Stop-ServicesInOrder','Get-NatsRunFacts',
         'Invoke-NatsWebText','ConvertFrom-VeeamNatsRequirementsHtml','Get-NatsSupportedVersions','ConvertFrom-NatsSha256Sums','Resolve-NatsPackageSha256',
+        'Get-MarkerForSummary','Get-BlockedRunNote',
         'Get-WshSettingsKeys','Test-WshSettingsKey','Get-WshDisabledValues','Get-WshWriteProblems','Enable-WshForInstaller','Restore-WshSettings','Get-WshRestorePending','Restore-WshForRun','Get-WshManualRestoreAction'
 foreach ($fn in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
     if ($want -contains $fn.Name) { . ([scriptblock]::Create($fn.Extent.Text)) }
 }
 function Write-Log { param($Message, $Level) }   # stub
+# No Veeam here, so -Recover's module check would always fail. Recovery tests that need
+# it to fail define their own; the real function is tested on its own below.
+function Test-VeeamModuleImport { param([switch] $Vbr, [switch] $Vb365) @() }   # stub
 
 # The shipping script waits up to 10 minutes for Veeam services to settle, because
 # VBR 13's Backup Service can genuinely take minutes. Tests use fakes that never
@@ -522,6 +526,24 @@ if ($isAdmin) {
         Check 'unsafe root: no result JSON'     (Test-Path (Join-Path $foreign 'last-result.json')) 'False'
         Check 'unsafe root: content untouched'  (Get-FileHash -LiteralPath (Join-Path $foreign 'their-data.txt') -Algorithm SHA256).Hash $foreignHash
         Check 'unsafe root: ACL untouched'      ((Get-Acl -LiteralPath $foreign).Sddl -eq $foreignSddl) 'True'
+
+        # Process-level check: a run blocked by an earlier run's marker names that run and
+        # its folder, and claims nothing it did not check.
+        $blockedWr = Join-Path $base 'blocked-wr'
+        & 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -NoLogo -NoProfile -File $script:Path -WorkRoot $blockedWr *> $null
+        $blockedRun = Join-Path $blockedWr 'runs\20260101-010203-004-4321'
+        New-Item -ItemType Directory -Path $blockedRun -Force | Out-Null
+        Write-AtomicJson -Path (Join-Path $blockedWr 'CHANGES-IN-PROGRESS.marker') -InputObject ([ordered]@{
+            SchemaVersion=1; RunId='20260101-010203-004-4321'; RunDir=$blockedRun; StateFile=(Join-Path $blockedRun 'recovery-state.json'); Stage='VERIFIED'; InstallerStarted=$true })
+        $blockedOut = (& 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -NoLogo -NoProfile -File $script:Path -WorkRoot $blockedWr 2>&1 | Out-String)
+        $blockedExit = $LASTEXITCODE
+        Check 'blocked run: exit 40'            $blockedExit 40
+        Check 'blocked run: PRIOR_RUN_INCOMPLETE' ($blockedOut -match 'Outcome=PRIOR_RUN_INCOMPLETE') 'True'
+        Check 'blocked run: RecoveryRunDir is the earlier run' ($blockedOut -match [regex]::Escape("RecoveryRunDir=$blockedRun;")) 'True'
+        Check 'blocked run: the honest note'    ($blockedOut -match 'This run changed no service, job or PostgreSQL state') 'True'
+        Check 'blocked run: no unchecked claim' ($blockedOut -cmatch 'Veeam services are STOPPED') 'False'
+        Check 'blocked run: the marker is in the log, not the summary' ($blockedOut -match 'Changes-in-progress marker .*"Stage":\s*"VERIFIED"' -and $blockedOut -notmatch 'is blocked: \{') 'True'
+        Check 'blocked run: makes no run folder of its own' @(Get-ChildItem -LiteralPath (Join-Path $blockedWr 'runs') -Directory).Count 1
 
         # 5. Drive root -> never ours. Reads only; C:\ always exists, so nothing is created.
         $r = Initialize-WorkRoot 'C:\'
@@ -1477,6 +1499,30 @@ try {
         Check 'pre-install recovery: no tuning'       ($a -contains 'TUNING') 'False'
         Check 'pre-install recovery: reads 2 services' ($a -contains 'RESTORE:2:VeeamBackupSvc+VeeamDeploySvc') 'True'
         Check 'pre-install recovery: reads 3 jobs'    (@($a | Where-Object { $_ -like 'ENABLE:*' }).Count) 3
+
+        # A -Recover in a PowerShell the Veeam module cannot load in (for example the
+        # NinjaOne agent's 5.1 on VBR 13) must change nothing at all.
+        # Fails only for the VBR module, so these checks also prove the recorded product
+        # (Products='VBR') decides which module is checked.
+        function Test-VeeamModuleImport { param([switch] $Vbr, [switch] $Vb365) if ($Vbr) { @("Veeam.Backup.PowerShell: requires a minimum Windows PowerShell version of '7.0'") } else { @() } }
+        Invoke-FinishScenario
+        Check 'wrong PowerShell: finishing stays diagnostic' $script:RecoveryCapture.Outcome 'RECOVERY_DIAGNOSTIC_ONLY'
+        Check 'wrong PowerShell: says why'           ($script:RecoveryCapture.Detail -match 'module does not load') 'True'
+        Check 'wrong PowerShell: finishing changes nothing' @($script:Actions).Count 0
+        $script:Svc = @{ 'postgresql-x64-15'='Stopped'; 'VeeamBackupSvc'='Stopped'; 'VeeamDeploySvc'='Stopped' }
+        Write-AtomicJson -Path $statePath -InputObject ([ordered]@{
+            SchemaVersion=1; RunId=$runId; RunDir=$runPath; Stage='SERVICES_STOPPED'; InstallerStarted=$false
+            Products='VBR'; OriginalVersion='15.2'; TargetVersion='15.19'
+            PgServiceName='postgresql-x64-15'; PsqlPath=$psqlFake; PgPort='5432' })
+        Write-AtomicJson -Path $markerPath -InputObject ([ordered]@{
+            SchemaVersion=1; RunId=$runId; RunDir=$runPath; StateFile=$statePath; Stage='SERVICES_STOPPED'; InstallerStarted=$false })
+        $script:Actions = @(); $script:RecoveryCapture = $null; $script:Report.IssueCode = ''
+        try { Invoke-ExplicitRecovery -MarkerPath $markerPath -Cfg (Get-DefaultConfig) }
+        catch { if ($_.Exception.Message -ne 'COMPLETE-RUN-TEST-SENTINEL') { throw } }
+        Check 'wrong PowerShell: pre-install refuses' $script:RecoveryCapture.Outcome 'RECOVERY_MODULE_UNAVAILABLE'
+        Check 'wrong PowerShell: pre-install exit 40' $script:RecoveryCapture.Code 40
+        Check 'wrong PowerShell: pre-install changes nothing' @($script:Actions).Count 0
+        Check 'wrong PowerShell: says to use PowerShell 7' ($script:Report.ActionRequired -match 'PowerShell 7') 'True'
     } finally {
         Remove-Item -LiteralPath $WorkRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -3178,6 +3224,19 @@ try {
         Check 'nothing switched yet: no revert'       ($script:Actions -contains 'NATS-REVERT') 'False'
         Check 'nothing switched yet: says NATS'       ($script:RecoveryCapture.Detail -match 'NATS was not changed') 'True'
 
+        # The VB365 module does not load (for example in Windows PowerShell 5.1): a NATS
+        # recovery that would act must change nothing. Fails only for -Vb365, so this also
+        # proves Products='VB365' decides which module is checked.
+        & {
+            function Test-VeeamModuleImport { param([switch] $Vbr, [switch] $Vb365) if ($Vb365) { @('Veeam.Archiver.PowerShell (needs PowerShell 7.4.2+): not loaded') } else { @() } }
+            Invoke-TestNatsRecover -NatsStage 'SWAPPED'
+            Check 'NATS, wrong PowerShell: refused'       $script:RecoveryCapture.Outcome 'RECOVERY_MODULE_UNAVAILABLE'
+            Check 'NATS, wrong PowerShell: NATS left alone' (@($script:Actions).Count) 0
+            Invoke-TestNatsRecover -Stage 'VERIFIED' -NatsStage 'COMMITTED'
+            Check 'NATS verified, wrong PowerShell: refused' $script:RecoveryCapture.Outcome 'RECOVERY_MODULE_UNAVAILABLE'
+            Check 'NATS verified, wrong PowerShell: no change' (@($script:Actions).Count) 0
+        }
+
         Invoke-TestNatsRecover -Change ''
         Check 'schema 2 without NATS is refused'      $script:RecoveryCapture.Outcome 'INVALID_RECOVERY_STATE'
         Invoke-TestNatsRecover -Schema 1 -MarkerSchema 1
@@ -3259,6 +3318,87 @@ $r2 = Invoke-Native 'cmd.exe' @('/c','echo hello')
 Check 'clean run exit 0'     $r2.ExitCode 0
 Check 'clean run stdout'     $r2.StdOut 'hello'
 Check 'clean run no stderr'  $r2.StdErr ''
+
+'--- A run blocked by an earlier marker says only what it knows ---'
+& {
+    $blockedRoot = Join-Path $env:TEMP "vpgu-blocked-$PID"
+    $blockedRuns = Join-Path $blockedRoot 'runs'
+    $oldRun = Join-Path $blockedRuns '20260101-010203-004-4321'
+    New-Item -ItemType Directory -Path $oldRun -Force | Out-Null
+    # %TEMP% can be an 8.3 short path; the function reports the full long form.
+    $oldRun = [IO.Path]::GetFullPath($oldRun)
+    try {
+        $mk = Join-Path $blockedRoot 'CHANGES-IN-PROGRESS.marker'
+        function Write-TestMarker { param($RunDir, $Stage, $Schema = 1) Write-AtomicJson -Path $mk -InputObject ([ordered]@{ SchemaVersion=$Schema; RunId='20260101-010203-004-4321'; RunDir=$RunDir; StateFile=(Join-Path "$RunDir" 'recovery-state.json'); Stage=$Stage; InstallerStarted=$true }) }
+        Write-TestMarker -RunDir $oldRun -Stage 'VERIFIED'
+        $m = Get-MarkerForSummary -Path $mk -RunsRoot $blockedRuns
+        Check 'marker: run, stage and folder'      "$($m.RunId) $($m.Stage) $($m.RunDir)" "20260101-010203-004-4321 VERIFIED $oldRun"
+        function Get-Service { [CmdletBinding()] param([string[]] $Name) @($script:BlockedFakeServices) }
+        $script:BlockedFakeServices = @([pscustomobject]@{ Name='VeeamBackupSvc'; Status='Running' }, [pscustomobject]@{ Name='VeeamDeploySvc'; Status='Stopped' })
+        $note = Get-BlockedRunNote -Marker $m -Recovering $false
+        Check 'blocked note: names the earlier run folder' ($note -like "*$oldRun*") 'True'
+        Check 'blocked note: makes no unchecked claim' ($note -cmatch 'STOPPED|DISABLED|MID-CHANGE') 'False'
+        Check 'blocked note: says this run changed nothing' ($note -match 'This run changed no service, job or PostgreSQL state') 'True'
+        Check 'blocked note: VERIFIED means PostgreSQL was verified' ($note -match 'already verified PostgreSQL') 'True'
+        Check 'blocked note: counts the Veeam services running now' ($note -match 'Veeam services running now: 1\.') 'True'
+        Check 'blocked note: services running means close out by hand' ($note -match 'Close the run out by hand') 'True'
+        Check 'blocked note: the close-out checks PostgreSQL first' ($note -match 'check that PostgreSQL reports the target version') 'True'
+        Check 'blocked note: the close-out ends VB365 maintenance' ($note -match 'end any VB365 maintenance session') 'True'
+        # A NATS run (SchemaVersion 2) never touched PostgreSQL, and -Recover finishes it.
+        Write-TestMarker -RunDir $oldRun -Stage 'VERIFIED' -Schema 2
+        $natsMarker = Get-MarkerForSummary -Path $mk -RunsRoot $blockedRuns
+        $natsNote = Get-BlockedRunNote -Marker $natsMarker -Recovering $false
+        Check 'NATS marker: read as a NATS run'    $natsMarker.IsNats 'True'
+        Check 'NATS note: says PostgreSQL was not touched' ($natsNote -match 'NATS update on VB365 and did not touch PostgreSQL') 'True'
+        Check 'NATS note: never claims PostgreSQL was verified' ($natsNote -match 'verified PostgreSQL') 'False'
+        Check 'NATS note: -Recover finishes it, even with services running' ($natsNote -match 'Run this script with -Recover: it finishes that run') 'True'
+        Check 'NATS note: no close-out by hand'     ($natsNote -match 'by hand') 'False'
+        # INSTALLING: PostgreSQL was never verified, so no hand close-out.
+        Write-TestMarker -RunDir $oldRun -Stage 'INSTALLING'
+        $installingNote = Get-BlockedRunNote -Marker (Get-MarkerForSummary -Path $mk -RunsRoot $blockedRuns) -Recovering $false
+        Check 'INSTALLING note: PostgreSQL was not verified' ($installingNote -match 'PostgreSQL was not verified after the installer ran') 'True'
+        Check 'INSTALLING note: no close-out by hand' ($installingNote -match 'Close the run out by hand') 'False'
+        Write-TestMarker -RunDir $oldRun -Stage 'COMPLETE'
+        Check 'COMPLETE note: only the marker was left' ((Get-BlockedRunNote -Marker (Get-MarkerForSummary -Path $mk -RunsRoot $blockedRuns) -Recovering $false) -match 'only its marker could not be removed') 'True'
+        Write-TestMarker -RunDir $oldRun -Stage 'VERIFIED'
+        $m = Get-MarkerForSummary -Path $mk -RunsRoot $blockedRuns
+        $script:BlockedFakeServices = @()
+        Check 'blocked note: services stopped means -Recover can finish' ((Get-BlockedRunNote -Marker $m -Recovering $false) -match 'Run this script with -Recover: it finishes') 'True'
+        Check 'blocked note: no -Recover advice inside -Recover' ((Get-BlockedRunNote -Marker $m -Recovering $true) -match 'Run this script with -Recover|by hand') 'False'
+        Write-TestMarker -RunDir $oldRun -Stage 'SERVICES_STOPPED'
+        Check 'blocked note: a pre-installer stage points at -Recover' ((Get-BlockedRunNote -Marker (Get-MarkerForSummary -Path $mk -RunsRoot $blockedRuns) -Recovering $false) -match 'puts back the recorded services and jobs') 'True'
+        Write-TestMarker -RunDir 'C:\Windows\System32' -Stage 'VERIFIED'
+        Check 'marker: a folder outside runs is not named' (Get-MarkerForSummary -Path $mk -RunsRoot $blockedRuns).RunDir ''
+        Write-TestMarker -RunDir (Join-Path $blockedRuns '20260101-010203-004-9999') -Stage 'VERIFIED'
+        Check 'marker: a run folder that does not exist is not named' (Get-MarkerForSummary -Path $mk -RunsRoot $blockedRuns).RunDir ''
+        Set-Content -LiteralPath $mk -Value 'not json'
+        $bad = Get-MarkerForSummary -Path $mk -RunsRoot $blockedRuns
+        Check 'marker: an unreadable marker gives nothing' "[$($bad.RunId)][$($bad.RunDir)]" '[][]'
+        Check 'blocked note: an unreadable marker says so' ((Get-BlockedRunNote -Marker $bad -Recovering $false) -match 'could not be read') 'True'
+    } finally {
+        Remove-Item -LiteralPath $blockedRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+$step2Block = $scriptText.IndexOf('$script:BlockingMarker = Get-MarkerForSummary')
+Check 'STEP 2 remembers the marker before recovery or the summary' ($step2Block -gt 0 -and $step2Block -lt $scriptText.IndexOf('if ($Recover) { Invoke-ExplicitRecovery -MarkerPath $script:MarkerFile') -and $step2Block -lt $scriptText.IndexOf("Complete-Run `$EXIT.ESCALATE 'PRIOR_RUN_INCOMPLETE'")) 'True'
+$completeRunBody = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Complete-Run' }, $true))[0].Extent.Text
+Check 'a blocked run gets the honest note'  ($completeRunBody -match [regex]::Escape('if ($script:BlockingMarker) {')) 'True'
+$blockedNoteBody = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Get-BlockedRunNote' }, $true))[0].Extent.Text
+Check 'the honest note never names this run folder' ($blockedNoteBody -match [regex]::Escape('$script:RunDir')) 'False'
+
+'--- -Recover checks the Veeam module loads before it changes anything ---'
+& {
+    foreach ($fn in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -in @('Test-VeeamModuleImport', 'Get-Vb365ModulePath') }, $true)) {
+        . ([scriptblock]::Create($fn.Extent.Text))
+    }
+    Check 'module check: nothing asked, nothing wrong' @(Test-VeeamModuleImport).Count 0
+    Check 'module check: a module that does not load is a problem' @(Test-VeeamModuleImport -Vbr).Count 1
+}
+$recoverBody = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Invoke-ExplicitRecovery' }, $true))[0].Extent.Text
+$moduleCheckAt = $recoverBody.IndexOf('Test-VeeamModuleImport')
+Check 'module check comes before NATS is put back' ($moduleCheckAt -gt 0 -and $moduleCheckAt -lt $recoverBody.IndexOf('Restore-NatsInstallation')) 'True'
+Check 'module check comes before services are restored' ($moduleCheckAt -lt $recoverBody.IndexOf('Pre-installer recovery is eligible')) 'True'
+Check 'finishing an install also needs the module' ($recoverBody -match [regex]::Escape('if ($moduleProblem) { $finishBlockers +=')) 'True'
 
 '--- Windows Script Host: on for the installer only, then put back exactly (KB4698, KB4699) ---'
 $wshTestRoot = "HKCU:\Software\VpguWshTest-$PID"

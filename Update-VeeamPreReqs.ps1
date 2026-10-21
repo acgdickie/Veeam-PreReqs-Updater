@@ -266,6 +266,8 @@ $script:ServiceSettleMinutes = 10
 $script:Vb365MaintenanceSessionId = $null
 $script:Vb365MaintenancePending = $false
 $script:RecoveryState = $null
+# Set in STEP 2 when an earlier run's marker exists: this run did not make that change.
+$script:BlockingMarker = $null
 $script:RollbackProblems = @()
 $script:EolBranch    = $false
 $script:Report       = [ordered]@{
@@ -2695,6 +2697,76 @@ function Get-WshManualRestoreAction {
     return "Turn Windows Script Host off again once the PostgreSQL installer has exited (Veeam KB4699). In an elevated PowerShell, run: $($commands -join '; ')"
 }
 
+# What a changes-in-progress marker says, for the summary only: the run that left it,
+# its recorded stage, and its run folder when that is a real run folder in this WorkRoot.
+# Anything unreadable stays empty; nothing here is used to change the server.
+function Get-MarkerForSummary {
+    param([Parameter(Mandatory)][string] $Path, [Parameter(Mandatory)][string] $RunsRoot)
+    $info = [pscustomobject]@{ RunId = ''; Stage = ''; RunDir = ''; IsNats = $false }
+    try {
+        $m = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $names = @($m.PSObject.Properties.Name)
+        if ($names -contains 'RunId') { $info.RunId = "$($m.RunId)" }
+        if ($names -contains 'Stage') { $info.Stage = "$($m.Stage)" }
+        # SchemaVersion 2 is a NATS run: PostgreSQL was never touched.
+        if ($names -contains 'SchemaVersion') { $info.IsNats = ("$($m.SchemaVersion)" -eq '2') }
+        if ($names -contains 'RunDir' -and "$($m.RunDir)") {
+            $dir = [IO.Path]::GetFullPath("$($m.RunDir)").TrimEnd('\')
+            $root = [IO.Path]::GetFullPath($RunsRoot).TrimEnd('\')
+            if ([IO.Path]::GetDirectoryName($dir) -ieq $root -and
+                [IO.Path]::GetFileName($dir) -match '^\d{8}-\d{6}-\d{3}-\d+$' -and
+                (Test-Path -LiteralPath $dir -PathType Container)) {
+                $info.RunDir = $dir
+            }
+        }
+    } catch {}
+    return $info
+}
+
+# The note for a run that did not make the change it reports on: a run stopped by an
+# earlier run's marker, or a -Recover that only reported. It says only what this run
+# knows - which run left the marker, its stage and folder, and how many Veeam services
+# run now - and never claims that services are stopped or jobs disabled.
+function Get-BlockedRunNote {
+    param($Marker, [bool] $Recovering)
+    $live = @(Get-Service -Name 'Veeam*' -ErrorAction SilentlyContinue | Where-Object { "$($_.Status)" -ne 'Stopped' })
+    if (-not $Marker -or -not "$($Marker.RunId)") {
+        return "This run changed no service, job or PostgreSQL state. The changes-in-progress marker could not be read: inspect it by hand. Veeam services running now: $($live.Count)."
+    }
+    $stage = "$($Marker.Stage)"
+    $isNats = [bool]$Marker.IsNats
+    $note = "This run changed no service, job or PostgreSQL state, and did not check the jobs. The server is as the earlier run $($Marker.RunId) left it (recorded stage $stage)."
+    if ($isNats) {
+        $note += ' That run was a NATS update on VB365 and did not touch PostgreSQL.'
+        if ($stage -eq 'VERIFIED') { $note += ' VB365 had already been verified on the new NATS.' }
+    } elseif ($stage -eq 'VERIFIED') {
+        $note += ' That run had already verified PostgreSQL at its target version.'
+    }
+    $note += " Veeam services running now: $($live.Count)."
+    if ("$($Marker.RunDir)") { $note += " Its backups and recovery state are in $($Marker.RunDir)." }
+    $note += ' The changes-in-progress marker is left in place.'
+    if (-not $Recovering) {
+        # The next step depends on the stage; each matches what -Recover will do with it.
+        $note += if ($stage -in @('JOBS_DISABLED', 'SERVICES_STOPPED')) {
+            if ($isNats) { ' Run this script with -Recover: it finishes the NATS update or puts the old NATS back, then restores the recorded services and jobs.' }
+            else { ' Run this script with -Recover: it puts back the recorded services and jobs.' }
+        } elseif ($isNats -and $stage -eq 'VERIFIED') {
+            ' Run this script with -Recover: it finishes that run, including ending VB365 maintenance mode and turning the jobs back on.'
+        } elseif ($stage -eq 'VERIFIED' -and $live.Count -gt 0) {
+            ' With Veeam services running, -Recover only reports. Close the run out by hand: check that PostgreSQL reports the target version, end any VB365 maintenance session recorded in recovery-state.json, turn back on the jobs listed in disabled-jobs.json, then move the marker aside (README: Closing out an earlier run by hand).'
+        } elseif ($stage -eq 'INSTALLING' -and $live.Count -gt 0) {
+            ' PostgreSQL was not verified after the installer ran, and with Veeam services running -Recover only reports. Read the installer logs in that folder and check the PostgreSQL version and health before turning anything back on (README: If it goes wrong).'
+        } elseif ($stage -in @('VERIFIED', 'INSTALLING')) {
+            ' Run this script with -Recover: it finishes the earlier run when PostgreSQL answers at the target version, and otherwise only reports.'
+        } elseif ($stage -eq 'COMPLETE') {
+            ' That run finished; only its marker could not be removed. Confirm the server is healthy, then move the marker aside (README: If it goes wrong, MARKER_REMOVE_FAILED).'
+        } else {
+            ' Read recovery-state.json in that folder and the README (If it goes wrong) before acting.'
+        }
+    }
+    return $note
+}
+
 # The stage notes in Complete-Run describe only what was rolled back. A run can also
 # start a stopped automatic Veeam service (STEP 14), close an open Veeam console (the
 # waits), or remove a leftover Enterprise Manager registry key (STEP 3). Add each one
@@ -2816,12 +2888,21 @@ function Complete-Run {
             else { $stateNote = "WARNING: rollback did not fully succeed - Veeam may still be down.$rollbackWhy"; $finalCode = $EXIT.ESCALATE }
         }
         'INSTALLING' {
-            $stateNote = "SERVER IS MID-CHANGE. Veeam services are STOPPED and jobs are DISABLED. Backups are in $($script:RunDir). The changes-in-progress marker is deliberately left in place."
-            if (-not $Recover) { $stateNote += ' Run this script with -Recover: it finishes the update when PostgreSQL is healthy at the target version. Otherwise it changes no service, job or PostgreSQL state, and only turns Windows Script Host off again if this run left it on.' }
+            if ($script:BlockingMarker) {
+                # An earlier run's marker stopped this run, or -Recover refused it: this
+                # run did not make the change, so say only what it knows.
+                $stateNote = Get-BlockedRunNote -Marker $script:BlockingMarker -Recovering ([bool]$Recover)
+            } else {
+                $stateNote = "SERVER IS MID-CHANGE. Veeam services are STOPPED and jobs are DISABLED. Backups are in $($script:RunDir). The changes-in-progress marker is deliberately left in place."
+                if (-not $Recover) { $stateNote += ' Run this script with -Recover: it finishes the update when PostgreSQL is healthy at the target version. Otherwise it changes no service, job or PostgreSQL state, and only turns Windows Script Host off again if this run left it on.' }
+            }
             if ($finalCode -lt $EXIT.ESCALATE) { $finalCode = $EXIT.ESCALATE }
         }
         'VERIFIED' {
-            $stateNote = if ($natsRun) {
+            $stateNote = if ($script:BlockingMarker -and $Outcome -eq 'RECOVERY_DIAGNOSTIC_ONLY') {
+                # Only the recorded stage says VERIFIED; this -Recover proved nothing.
+                Get-BlockedRunNote -Marker $script:BlockingMarker -Recovering ([bool]$Recover)
+            } elseif ($natsRun) {
                 "NATS is at the target version $((Get-NatsRunFacts).TargetVersion). Backups are in $($script:RunDir)."
             } else { "PostgreSQL is at the target version. Backups are in $($script:RunDir)." }
         }
@@ -3378,6 +3459,27 @@ function Get-FileVersionSafe {
 }
 
 # Veeam modules must be loadable before we can prove anything about jobs.
+function Get-Vb365ModulePath {
+    return 'C:\Program Files\Veeam\Backup365\Veeam.Archiver.PowerShell\Veeam.Archiver.PowerShell.psd1'
+}
+
+# Can this PowerShell load the Veeam module(s)? Import only, with no connection, so it
+# works while the Veeam services are stopped. VBR 13 and VB365 need PowerShell 7.
+# Returns one problem per module that does not load.
+function Test-VeeamModuleImport {
+    param([switch] $Vbr, [switch] $Vb365)
+    $failed = @()
+    if ($Vbr) {
+        try { Import-Module Veeam.Backup.PowerShell -ErrorAction Stop -WarningAction SilentlyContinue }
+        catch { $failed += "Veeam.Backup.PowerShell: $($_.Exception.Message)" }
+    }
+    if ($Vb365) {
+        try { Import-Module (Get-Vb365ModulePath) -ErrorAction Stop -WarningAction SilentlyContinue }
+        catch { $failed += "Veeam.Archiver.PowerShell (needs PowerShell 7.4.2+): $($_.Exception.Message)" }
+    }
+    return $failed
+}
+
 function Connect-VeeamModules {
     param([switch] $Vbr, [switch] $Vb365, [switch] $Quiet, [switch] $Reconnect)
     $failed = @()
@@ -3402,9 +3504,8 @@ function Connect-VeeamModules {
         }
     }
     if ($Vb365) {
-        $vboModule = 'C:\Program Files\Veeam\Backup365\Veeam.Archiver.PowerShell\Veeam.Archiver.PowerShell.psd1'
         try {
-            Import-Module $vboModule -ErrorAction Stop -WarningAction SilentlyContinue
+            Import-Module (Get-Vb365ModulePath) -ErrorAction Stop -WarningAction SilentlyContinue
             if ($Reconnect -and (Get-Command Disconnect-VBOServer -ErrorAction SilentlyContinue)) {
                 try { Disconnect-VBOServer -ErrorAction Stop | Out-Null } catch {}
             }
@@ -4769,6 +4870,21 @@ function Invoke-ExplicitRecovery {
     # finish. Put the old NATS back, or keep the new one when VB365 already ran on it
     # and NATS answers at that version, then restore services and jobs as usual.
     $natsRun = ($stateChange -ceq 'NATS')
+
+    # Recovery starts services and turns jobs back on, and it needs the Veeam module to
+    # reach the jobs. Check now, before any change, that the module loads in this
+    # PowerShell (VBR 13 and VB365 need PowerShell 7). Otherwise a -Recover in the wrong
+    # edition starts Veeam, cannot reach the jobs, and leaves a run -Recover then refuses.
+    $recoverProducts = "$(Get-CfgValue $state 'Products' '')"
+    $moduleProblem = @(Test-VeeamModuleImport -Vbr:($recoverProducts -match '(^|\+)VBR($|\+)') -Vb365:($recoverProducts -match '(^|\+)VB365($|\+)')) -join ' | '
+    # Only where recovery would act: a pre-installer stage, or a verified NATS run it
+    # would finish. Every other stage is diagnostic-only or refused anyway.
+    $recoveryActs = ($script:Stage -in @('JOBS_DISABLED', 'SERVICES_STOPPED')) -or ($natsRun -and $script:Stage -eq 'VERIFIED')
+    if ($moduleProblem -and $recoveryActs) {
+        $script:Report.IssueCode = 'RECOVERY_MODULE_UNAVAILABLE'
+        $script:Report.ActionRequired = 'Run -Recover again in the PowerShell the Veeam module needs: PowerShell 7 for VBR 13 and VB365. Nothing was changed.'
+        Complete-Run $EXIT.ESCALATE 'RECOVERY_MODULE_UNAVAILABLE' "The Veeam PowerShell module does not load in PowerShell $($PSVersionTable.PSVersion), so this -Recover could not finish the run and changed nothing: $(Format-ShortText $moduleProblem 400)"
+    }
     $natsFinish = $false
     $natsKeptNew = $false
     if ($natsRun) {
@@ -4863,6 +4979,7 @@ function Invoke-ExplicitRecovery {
         if ($installerProcs.Count -gt 0) { $finishBlockers += "the PostgreSQL installer is still running (PID $(@($installerProcs | ForEach-Object { $_.Id }) -join ', '))" }
         $liveVeeam = @(Get-Service -Name 'Veeam*' -ErrorAction SilentlyContinue | Where-Object { "$($_.Status)" -ne 'Stopped' })
         if ($liveVeeam.Count -gt 0) { $finishBlockers += "Veeam service(s) are no longer stopped ($(@($liveVeeam | ForEach-Object { $_.Name }) -join ', ')), so finishing has already started by hand" }
+        if ($moduleProblem) { $finishBlockers += "the Veeam PowerShell module does not load in PowerShell $($PSVersionTable.PSVersion), so run -Recover in the PowerShell it needs ($(Format-ShortText $moduleProblem 200))" }
 
         if ($finishBlockers.Count -eq 0) {
             $finishAfterInstall = $true
@@ -5191,12 +5308,20 @@ if ($Install -and (Test-Path Variable:\PSSenderInfo) -and $PSSenderInfo) {
 # Leftover marker from a previous broken run. This is NOT routine - it means a
 # prior run was interrupted mid-change, or finished with something needing a human.
 if (Test-Path $script:MarkerFile) {
+    # This run did not make the change the marker records. Remember the marker, so the
+    # summary names the earlier run and its folder, not a folder this run never made.
+    $script:BlockingMarker = Get-MarkerForSummary -Path $script:MarkerFile -RunsRoot (Join-Path $WorkRoot 'runs')
+    if ($script:BlockingMarker.RunDir) { $script:Report.RecoveryRunDir = $script:BlockingMarker.RunDir }
+    # The whole marker goes to the log, for -Recover too. The summary names its run and
+    # folder instead, so the next step still fits in the RMM line.
+    $marker = ''
+    try { $marker = (Get-Content -LiteralPath $script:MarkerFile -Raw -ErrorAction Stop).Trim() } catch { $marker = "(unreadable: $($_.Exception.Message))" }
+    Write-Log "Changes-in-progress marker $($script:MarkerFile): $(Format-ShortText $marker 2000)" WARN
     if ($Recover) { Invoke-ExplicitRecovery -MarkerPath $script:MarkerFile -Cfg $Cfg }
-    $marker = (Get-Content $script:MarkerFile -Raw).Trim()
     $script:Stage = 'INSTALLING'
     $script:Report.IssueCode = 'PRIOR_RUN_INCOMPLETE'
-    $script:Report.ActionRequired = "PAGE AN OPERATOR. Run this script with -Recover for a validated pre-installer recovery or post-installer diagnosis."
-    Complete-Run $EXIT.ESCALATE 'PRIOR_RUN_INCOMPLETE' "A previous run left a recovery marker, so normal audit/install is blocked: $marker"
+    $script:Report.ActionRequired = 'PAGE AN OPERATOR. An earlier run did not finish. Detail says the next step: -Recover, or closing that run out by hand.'
+    Complete-Run $EXIT.ESCALATE 'PRIOR_RUN_INCOMPLETE' "A previous run left a recovery marker ($($script:MarkerFile)), so normal audit/install is blocked."
 }
 if ($Recover) {
     Complete-Run $EXIT.OK 'RECOVERY_NOT_NEEDED' 'No recovery marker exists. Nothing was changed.'
