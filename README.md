@@ -35,6 +35,7 @@ Should you follow the above procedure this can take alot of time and effort and 
   Manager records](#leftover-enterprise-manager-records). Veeam ONE counts as installed only
   when its `HKLM:\SOFTWARE\Veeam\Veeam ONE` key has a Veeam ONE service or installed-programs
   entry behind it; a key left by an uninstall is logged as a leftover and does not block.
+  `-RemoveStaleVeeamOneRecord` deletes such a leftover key, after a `.reg` backup.
 * **Windows only.** On the Veeam Linux appliance, PostgreSQL comes from Veeam Updater.
   Do not hand-patch those. The script refuses.
 * **Minor updates only, always to the latest release on the installed major.** The script
@@ -198,13 +199,14 @@ look too.
 The console summary and `last-result.json` hold every report field, in this order:
 `Computer`, `Timestamp`, `Mode`, `VeeamProducts`, `PgMajor`, `PgInstalled`, `PgTarget`,
 `PgEol`, `NatsInstalled`, `NatsTarget`, `NatsStatus`, `NatsDetail`, `StaleEmRecord`,
-`WshStatus`, `Stage`, `Outcome`, `ExitCode`, `RebootRequired`, `RebootScheduledAt`, `IssueCode`,
+`StaleVeeamOneRecord`, `WshStatus`, `Stage`, `Outcome`, `ExitCode`, `RebootRequired`, `RebootScheduledAt`, `IssueCode`,
 `ActionRequired`, `JobsLeftDisabled`, `UnhealthyServices`, `ServicesStarted`,
 `ConsolesClosed`, `Vb365SyncStuck`, `RecoveryRunDir`, `Detail` and `LogPath`. When the run
 has a run folder (`-Install` creates one; `-Recover` uses the interrupted run's), the same
 result is also written to `result.json` there. `StaleEmRecord` is `present` when a leftover
 Enterprise Manager registry key was found, and `removed; backup <path>` after
-`-RemoveStaleEnterpriseManagerRecord` deleted it. `WshStatus` says what happened to
+`-RemoveStaleEnterpriseManagerRecord` deleted it. `StaleVeeamOneRecord` does the same for a
+leftover Veeam ONE key and `-RemoveStaleVeeamOneRecord`. `WshStatus` says what happened to
 Windows Script Host: see [Windows Script Host and Veeam hardening](#windows-script-host-and-veeam-hardening).
 `ServicesStarted` lists
 stopped automatic Veeam services the run started to rescue a failed configuration backup,
@@ -217,7 +219,7 @@ Every summary line carries a `Stage=` field telling you exactly how far it got:
 
 | Stage | What it means |
 |---|---|
-| `UNTOUCHED` | No schedule, service, or PostgreSQL state was changed. Guaranteed. An `-Install` run may have closed an open Veeam console (see `ConsolesClosed`), and `-RemoveStaleEnterpriseManagerRecord` may have removed a leftover registry key, in an audit too (see `StaleEmRecord`) |
+| `UNTOUCHED` | No schedule, service, or PostgreSQL state was changed. Guaranteed. An `-Install` run may have closed an open Veeam console (see `ConsolesClosed`), and `-RemoveStaleEnterpriseManagerRecord` or `-RemoveStaleVeeamOneRecord` may have removed a leftover registry key, in an audit too (see `StaleEmRecord` and `StaleVeeamOneRecord`) |
 | `JOBS_DISABLED` | Schedules have been disabled; the installer has not started |
 | `SERVICES_STOPPED` | Services are stopped; the PostgreSQL installer has not started. On a NATS update run, this stage also covers switching NATS, starting VB365 on it, and switching NATS back on failure: read `NatsStatus` |
 | `INSTALLING` | **Mid-change.** The installer may have started; automatic rollback is prohibited |
@@ -239,6 +241,7 @@ final state record. Codes `40` and `50` can deliberately leave schedules disable
 | `-WorkRoot` | `C:\ProgramData\VeeamPgUpdate` | Protected logs and recovery evidence, including dumps and the cold copy |
 | `-SkipDownloadInAudit` | off | Skip the EnterpriseDB installer-availability check; the audit still contacts PostgreSQL's version feed and, on VB365, Veeam's help center (and GitHub when a NATS update is due) |
 | `-RemoveStaleEnterpriseManagerRecord` | off | Delete a proven-stale `Veeam Backup Reporting` registry key, after exporting and verifying a `.reg` backup into the `logs` folder. Works in an audit run too, without `-Install`. `StaleEmRecord` reports the result; a failed removal is exit `20` (`STALE_EM_RECORD_REMOVE_FAILED`) |
+| `-RemoveStaleVeeamOneRecord` | off | Delete a proven-stale `HKLM\SOFTWARE\Veeam\Veeam ONE` registry key (no Veeam ONE service and no Veeam ONE installed program), after exporting and verifying a `.reg` backup into the `logs` folder. Works in an audit run too, without `-Install`. `StaleVeeamOneRecord` reports the result; a failed removal is exit `20` (`STALE_VEEAM_ONE_RECORD_REMOVE_FAILED`) |
 
 **There is no maintenance window.** `-Install` means "go now". It runs when you run the
 RMM script or policy. The independent RMM owns the maintenance window, retries, the reboot unless
@@ -493,7 +496,7 @@ the RMM summary. See [Exit codes](#exit-codes) and [If it goes wrong](#if-it-goe
 |---|---|---|
 | STEP 1 - Load settings | Loads the settings built into the script, then purges logs and completed run folders older than `retentionDays`. It keeps unresolved runs and the two newest completed recovery sets. | Settings come only from the reviewed script. Without the purge, daily audits would fill the disk. |
 | STEP 2 - Context checks | Checks the switch combination, that the server runs Windows and is not a Veeam appliance, that the run is elevated, and that `-Install` is not over PowerShell remoting. A changes-in-progress marker sends `-Recover` to recovery and stops every other run (`PRIOR_RUN_INCOMPLETE`, exit `40`). `-Recover` with no marker ends here (`RECOVERY_NOT_NEEDED`, exit `0`). | Each of these breaks an unattended update. An interrupted run must be dealt with before a new one starts. |
-| STEP 3 - Detect Veeam products | Finds VBR, VB365, Veeam ONE (its registry key plus a Veeam ONE service or installed program; the key alone is a leftover) and Enterprise Manager, and a leftover Enterprise Manager registry key (removing it with `-RemoveStaleEnterpriseManagerRecord`). Warns about Veeam services set to start automatically that are stopped. Refuses topologies outside the supported profile. | Decides which product profile applies, and stops early on a server the script does not support. |
+| STEP 3 - Detect Veeam products | Finds VBR, VB365, Veeam ONE (its registry key plus a Veeam ONE service or installed program; the key alone is a leftover, removed with `-RemoveStaleVeeamOneRecord`) and Enterprise Manager, and a leftover Enterprise Manager registry key (removing it with `-RemoveStaleEnterpriseManagerRecord`). Warns about Veeam services set to start automatically that are stopped. Refuses topologies outside the supported profile. | Decides which product profile applies, and stops early on a server the script does not support. |
 | STEP 4 - Confirm database engine | Reads where each product keeps its database: VBR's active engine and connection from the registry, Enterprise Manager's database the same way, and VB365's `Config.xml` and `Proxy.xml`. All must be local PostgreSQL on one port. | Nothing is guessed. A remote database or two ports means the script cannot tell what it is updating. |
 | STEP 5 - Detect PostgreSQL installation | Requires exactly one PostgreSQL installation in the registry and one PostgreSQL Windows service, which must run `pg_ctl.exe` or `postgres.exe` from that installation. Checks that `psql`, `pg_dump`, `pg_dumpall` and `pg_restore` are there. | The installer must patch the instance Veeam really uses, and the backup tools must exist. |
 | STEP 6 - Read running server version | Requires PostgreSQL to be running and logs in as `postgres` (Windows SSPI), naming the cause if the login is refused. Reads the running version. Proves the data directory on Veeam's port is the registry's, keeps `WorkRoot` outside it, checks for a pooler or port mismatch, lists the databases, and refuses replication, standby or Windows Failover Clustering. | Proves the instance is the right one, standalone, and reachable, before anything else. |
@@ -787,6 +790,8 @@ C:\ProgramData\VeeamPgUpdate\
     last-result.json                          machine-readable result
     stale-enterprise-manager-record-<timestamp>.reg   backup of a leftover key that
                                               -RemoveStaleEnterpriseManagerRecord deleted
+    stale-veeam-one-record-<timestamp>.reg    backup of a leftover key that
+                                              -RemoveStaleVeeamOneRecord deleted
   runs\<timestamp>\
     recovery-state.json       versioned state used by -Recover
     result.json               this run's result (logs\last-result.json is overwritten by each run)
@@ -1178,6 +1183,10 @@ you change a script, add your entry at the top.
   it could not be turned off again.
 * README: [Closing out an earlier run by hand](#if-it-goes-wrong), for a `VERIFIED` marker
   when the Veeam services already run.
+* `-RemoveStaleVeeamOneRecord`: deletes a leftover `HKLM\SOFTWARE\Veeam\Veeam ONE` key that
+  this run proved stale, after a verified `.reg` backup in the log folder, in an audit too.
+  Report field `StaleVeeamOneRecord` (`present`, or `removed; backup <path>`). A failed
+  removal is exit `20` (`STALE_VEEAM_ONE_RECORD_REMOVE_FAILED`).
 
 #### Fixed
 

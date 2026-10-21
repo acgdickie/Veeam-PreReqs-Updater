@@ -93,6 +93,7 @@ Check 'ConfigPath parameter removed'    ($scriptParameterNames -contains 'Config
 Check 'Install parameter remains'       ($scriptParameterNames -contains 'Install')       'True'
 Check 'Recover parameter exposed'       ($scriptParameterNames -contains 'Recover')       'True'
 Check 'stale EM removal switch exposed' ($scriptParameterNames -contains 'RemoveStaleEnterpriseManagerRecord') 'True'
+Check 'stale Veeam ONE removal switch exposed' ($scriptParameterNames -contains 'RemoveStaleVeeamOneRecord') 'True'
 # A leftover registry key alone must never count as an installed Enterprise Manager.
 $scriptText = Get-Content -LiteralPath $script:Path -Raw
 Check 'EM needs service or files'       ($scriptText -match 'emServices\.Count -gt 0 -or \$emPaths\.Count -gt 0') 'True'
@@ -1844,6 +1845,13 @@ Check 'Complete-Run adds the side-effect notes'  ($scriptText -match '\$stateNot
     $n = Add-RunSideEffectNotes -StateNote 'Nothing was changed.' -Report (New-Report -Em 'removed; backup C:\x.reg')
     Check 'EM key removed: no "Nothing was changed"' ($n -match 'Nothing was changed') 'False'
     Check 'EM key removed: says so'               ($n -match 'removed the leftover Enterprise Manager registry key') 'True'
+    $voneReport = New-Report
+    $voneReport['StaleVeeamOneRecord'] = 'present'
+    Check 'Veeam ONE key only present: note unchanged' (Add-RunSideEffectNotes -StateNote 'Nothing was changed.' -Report $voneReport) 'Nothing was changed.'
+    $voneReport['StaleVeeamOneRecord'] = 'removed; backup C:\y.reg'
+    $n = Add-RunSideEffectNotes -StateNote 'Nothing was changed.' -Report $voneReport
+    Check 'Veeam ONE key removed: no "Nothing was changed"' ($n -match 'Nothing was changed') 'False'
+    Check 'Veeam ONE key removed: says so'        ($n -match 'removed the leftover Veeam ONE registry key') 'True'
 
     $n = Add-RunSideEffectNotes -StateNote 'Nothing was changed.' -Report (New-Report -Closed 'Veeam.Backup.Shell:PID9(session 2)')
     Check 'console closed: no "Nothing was changed"' ($n -match 'Nothing was changed') 'False'
@@ -3330,6 +3338,14 @@ $voneStep3 = $scriptText.Substring($scriptText.IndexOf('# --- Veeam ONE (co-resi
 $voneStep3 = $voneStep3.Substring(0, $voneStep3.IndexOf('# --- Enterprise Manager'))
 Check 'Veeam ONE: STEP 3 needs a sign besides the key' ($voneStep3 -match '(?s)\$veeamOneEvidence = @\(Get-VeeamOneEvidence\)\s+if \(\$veeamOneEvidence\.Count -gt 0\) \{\s+\$products \+= \[pscustomobject\]@\{ Name=''VeeamONE''') 'True'
 Check 'Veeam ONE: a key alone is reported as leftover' ($voneStep3 -match 'Treating it as a leftover record from an uninstall') 'True'
+Check 'Veeam ONE: only a proven leftover is offered for removal' ($voneStep3 -match "(?s)\} else \{\s+\`$script:StaleVeeamOneKey = 'HKLM:\\SOFTWARE\\Veeam\\Veeam ONE'") 'True'
+$voneRemoval = $scriptText.Substring($scriptText.IndexOf('if ($RemoveStaleVeeamOneRecord) {'))
+$voneRemoval = $voneRemoval.Substring(0, $voneRemoval.IndexOf("`$script:Report.VeeamProducts ="))
+Check 'Veeam ONE removal needs proven stale' ($voneRemoval -match [regex]::Escape('if (-not $script:StaleVeeamOneKey) {')) 'True'
+Check 'Veeam ONE removal backs up first'     ($voneRemoval -match [regex]::Escape('Remove-StaleVeeamRegistryRecord -Key $script:StaleVeeamOneKey -BackupPath $voneBackup')) 'True'
+Check 'Veeam ONE removal failure is exit 20' ($voneRemoval -match [regex]::Escape("Complete-Run `$EXIT.PREFLIGHT 'STALE_VEEAM_ONE_RECORD_REMOVE_FAILED'")) 'True'
+Check 'Veeam ONE removal is reported'        ($voneRemoval -match [regex]::Escape('$script:Report.StaleVeeamOneRecord = "removed; backup $voneBackup"')) 'True'
+Check 'Veeam ONE removal comes before the Veeam ONE refusal' ($scriptText.IndexOf('if ($RemoveStaleVeeamOneRecord) {') -lt $scriptText.IndexOf("'VEEAM_ONE_PRESENT'")) 'True'
 Check 'Veeam ONE: no Get-Service listing of every service' ($voneStep3 + @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Get-VeeamOneEvidence' }, $true))[0].Extent.Text -match '\(Get-Service|Get-Service\s+-|Get-Service\s*\|') 'False'
 
 '--- A run blocked by an earlier marker says only what it knows ---'

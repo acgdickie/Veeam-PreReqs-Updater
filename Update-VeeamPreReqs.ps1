@@ -79,6 +79,13 @@
     This touches the registry only. It does not change the Veeam configuration
     database, so it does not clear a VBR-side Enterprise Manager connection record.
 
+.PARAMETER RemoveStaleVeeamOneRecord
+    Delete the leftover HKLM\SOFTWARE\Veeam\Veeam ONE registry key when this run has
+    PROVEN Veeam ONE is not installed (no Veeam ONE service and no Veeam ONE entry in
+    installed programs). A .reg backup is exported into the log folder first, and the
+    key is removed only after that backup is verified. If Veeam ONE really is
+    installed, or no leftover key was found, nothing is removed. Works in an audit too.
+
 .PARAMETER SkipDownloadInAudit
     Audit mode normally checks the EnterpriseDB download page for the exact
     Windows x64 installer. This skips that check. The audit still contacts
@@ -123,7 +130,8 @@ param(
     [switch] $Recover,
     [string] $WorkRoot = 'C:\ProgramData\VeeamPgUpdate',
     [switch] $SkipDownloadInAudit,
-    [switch] $RemoveStaleEnterpriseManagerRecord
+    [switch] $RemoveStaleEnterpriseManagerRecord,
+    [switch] $RemoveStaleVeeamOneRecord
 )
 
 $ErrorActionPreference = 'Stop'
@@ -259,6 +267,7 @@ $script:NatsStartupType = $null
 $script:PgServiceName = $null
 $script:PgStartupType = $null
 $script:StaleEnterpriseManagerKey = $null
+$script:StaleVeeamOneKey = $null
 # How long to let Veeam services reach their recorded state. VBR 13's Backup
 # Service can take minutes because it starts and waits on the Identity Service as
 # a child process, so the Windows 30-second service-start timeout fires first.
@@ -284,6 +293,7 @@ $script:Report       = [ordered]@{
     NatsStatus     = ''
     NatsDetail     = ''
     StaleEmRecord  = ''
+    StaleVeeamOneRecord = ''
     WshStatus      = ''
     Stage          = 'UNTOUCHED'
     Outcome        = 'UNKNOWN'
@@ -2794,6 +2804,9 @@ function Add-RunSideEffectNotes {
     if ($closedList) { $notes += "This run closed the open Veeam console(s) $closedList; anything unsaved in them was lost." }
     if ("$($Report['StaleEmRecord'])" -like 'removed*') {
         $notes += 'This run removed the leftover Enterprise Manager registry key; StaleEmRecord names its .reg backup.'
+    }
+    if ("$($Report['StaleVeeamOneRecord'])" -like 'removed*') {
+        $notes += 'This run removed the leftover Veeam ONE registry key; StaleVeeamOneRecord names its .reg backup.'
     }
     if ($notes.Count -eq 0) { return $StateNote }
     if ($StateNote -eq 'Nothing was changed.') { $StateNote = 'No schedule, service or PostgreSQL state was changed.' }
@@ -5420,7 +5433,10 @@ if (Test-Path 'HKLM:\SOFTWARE\Veeam\Veeam ONE') {
         $products += [pscustomobject]@{ Name='VeeamONE'; Version=$null; CorePath=$null }
         Write-Log "Veeam ONE is treated as installed on this server: $(Format-ShortText ($veeamOneEvidence -join '; ') 300)" WARN
     } else {
+        $script:StaleVeeamOneKey = 'HKLM:\SOFTWARE\Veeam\Veeam ONE'
+        $script:Report.StaleVeeamOneRecord = 'present'
         Write-Log 'HKLM:\SOFTWARE\Veeam\Veeam ONE exists, but no Veeam ONE service or installed program does. Treating it as a leftover record from an uninstall, not an installation.' WARN
+        Write-Log '  To clear the leftover record, rerun this script once with -RemoveStaleVeeamOneRecord. It exports a .reg backup into the log folder first.' WARN
     }
 }
 
@@ -5473,6 +5489,23 @@ if ($RemoveStaleEnterpriseManagerRecord) {
         Write-Log "Removed the leftover record $($script:StaleEnterpriseManagerKey). Backup: $emBackup" OK
         $script:Report.StaleEmRecord = "removed; backup $emBackup"
         $script:StaleEnterpriseManagerKey = $null
+    }
+}
+
+# The same for a leftover Veeam ONE key: only when this run proved it stale above.
+if ($RemoveStaleVeeamOneRecord) {
+    if (-not $script:StaleVeeamOneKey) {
+        Write-Log '-RemoveStaleVeeamOneRecord was passed, but this run did not prove a leftover Veeam ONE record. Nothing was removed.' WARN
+    } else {
+        $voneBackup = Join-Path $script:LogDir "stale-veeam-one-record-$($script:Stamp).reg"
+        try {
+            [void](Remove-StaleVeeamRegistryRecord -Key $script:StaleVeeamOneKey -BackupPath $voneBackup)
+        } catch {
+            Complete-Run $EXIT.PREFLIGHT 'STALE_VEEAM_ONE_RECORD_REMOVE_FAILED' "Could not remove the leftover Veeam ONE registry record $($script:StaleVeeamOneKey): $($_.Exception.Message)"
+        }
+        Write-Log "Removed the leftover record $($script:StaleVeeamOneKey). Backup: $voneBackup" OK
+        $script:Report.StaleVeeamOneRecord = "removed; backup $voneBackup"
+        $script:StaleVeeamOneKey = $null
     }
 }
 
