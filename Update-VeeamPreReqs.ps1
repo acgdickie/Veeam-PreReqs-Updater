@@ -282,6 +282,7 @@ $script:Report       = [ordered]@{
     NatsStatus     = ''
     NatsDetail     = ''
     StaleEmRecord  = ''
+    WshStatus      = ''
     Stage          = 'UNTOUCHED'
     Outcome        = 'UNKNOWN'
     ExitCode       = $null
@@ -2488,6 +2489,212 @@ function Get-UnrestoredJobNames {
     } | ForEach-Object { "$($_.Name)" } | Where-Object { $_ } | Sort-Object -Unique)
 }
 
+# Windows Script Host (WSH). Veeam's hardening advice turns it off, and the PostgreSQL
+# installer fails part-way without it (Veeam KB4698). Veeam's fix is to turn it on for
+# the install and off again afterwards, with no restart (KB4699). These are the two keys
+# KB4699 names. The user key belongs to the account this script runs as (the installer
+# runs as it too). It is written as HKEY_USERS\<SID>, not HKCU, because a later -Recover
+# may run as another account and must still put back this account's value.
+function Get-WshSettingsKeys {
+    # An account whose profile is not loaded uses HKEY_USERS\.DEFAULT as its HKCU, and so
+    # does the installer it starts. (For SYSTEM, HKEY_USERS\S-1-5-18 is .DEFAULT.)
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $userHive = if (Test-Path -LiteralPath "Registry::HKEY_USERS\$sid") { $sid } else { '.DEFAULT' }
+    return @('HKLM:\SOFTWARE\Microsoft\Windows Script Host\Settings',
+             "Registry::HKEY_USERS\$userHive\Software\Microsoft\Windows Script Host\Settings")
+}
+
+# True only for the keys above: HKLM's, or one account's under HKEY_USERS by its SID (or
+# .DEFAULT). \z, not $: a key name that ends in a line break must not pass.
+function Test-WshSettingsKey {
+    param([AllowEmptyString()][string] $Key)
+    return ($Key -ieq 'HKLM:\SOFTWARE\Microsoft\Windows Script Host\Settings' -or
+            $Key -imatch '^Registry::HKEY_USERS\\(S-1-[0-9-]+|\.DEFAULT)\\Software\\Microsoft\\Windows Script Host\\Settings\z')
+}
+
+# The 'Enabled' values that turn WSH off. Each record holds the key, the value's registry
+# type and its data: everything Restore-WshSettings needs to put it back exactly.
+function Get-WshDisabledValues {
+    param([string[]] $Keys = (Get-WshSettingsKeys))
+    $records = @()
+    foreach ($key in $Keys) {
+        $item = Get-Item -LiteralPath $key -ErrorAction SilentlyContinue
+        if (-not $item) { continue }
+        $value = $item.GetValue('Enabled')
+        if ($null -eq $value) { continue }
+        $number = $null
+        try { $number = [int64]$value } catch { continue }
+        if ($number -ne 0) { continue }
+        $records += [pscustomobject][ordered]@{
+            Key   = $key
+            Kind  = "$($item.GetValueKind('Enabled'))"
+            Value = $value
+        }
+    }
+    return $records
+}
+
+# Can this account change each value? Opening a key for writing asks for the right that
+# deleting and re-creating 'Enabled' needs, and changes nothing. Returns one problem per
+# key it cannot change, so a run can stop before the outage instead of during it.
+function Get-WshWriteProblems {
+    param([AllowEmptyCollection()][object[]] $Records = @())
+    $problems = @()
+    foreach ($record in $Records) {
+        $key = '(unreadable record)'
+        $handle = $null
+        try {
+            $key = "$($record.Key)"
+            if ($key -match '^HKLM:\\(.+)$') { $base = [Microsoft.Win32.Registry]::LocalMachine }
+            elseif ($key -match '^Registry::HKEY_USERS\\(.+)$') { $base = [Microsoft.Win32.Registry]::Users }
+            elseif ($key -match '^HKCU:\\(.+)$') { $base = [Microsoft.Win32.Registry]::CurrentUser }
+            else { throw 'it is not a registry path this script knows' }
+            $handle = $base.OpenSubKey($Matches[1], $true)
+            if (-not $handle) { throw 'the key cannot be opened' }
+        } catch {
+            $problems += "${key}: $($_.Exception.Message)"
+        } finally {
+            if ($handle) { $handle.Dispose() }
+        }
+    }
+    return $problems
+}
+
+# Turn WSH on the way KB4699 does: delete each 'Enabled' value that turns it off. The
+# caller saves the records first, so the exact values can always be put back.
+function Enable-WshForInstaller {
+    param(
+        [Parameter(Mandatory)][object[]] $Records,
+        [string[]] $Keys = (Get-WshSettingsKeys)
+    )
+    foreach ($record in $Records) {
+        Remove-ItemProperty -LiteralPath "$($record.Key)" -Name 'Enabled' -ErrorAction Stop
+    }
+    $stillOff = @(Get-WshDisabledValues -Keys $Keys)
+    if ($stillOff.Count -gt 0) {
+        throw "it is still turned off at $(@($stillOff | ForEach-Object { $_.Key }) -join ' and ')"
+    }
+}
+
+# Put back the exact 'Enabled' values from Get-WshDisabledValues. The records can come
+# from a file on disk, so only the WSH Settings keys and plain value types are accepted
+# (AllowedKeys replaces that rule, for tests). A value that already holds the saved type
+# and data is left alone, so a value that was never changed needs no write access.
+# Returns the problems (none means all are back) and how many values were written.
+function Restore-WshSettings {
+    param(
+        [AllowEmptyCollection()][object[]] $Records = @(),
+        [string[]] $AllowedKeys = @()
+    )
+    $problems = @()
+    $written = 0
+    foreach ($record in $Records) {
+        $key = '(unreadable record)'
+        try {
+            $key = "$($record.Key)"
+            $kind = "$($record.Kind)"
+            $allowed = if (@($AllowedKeys).Count -gt 0) { @($AllowedKeys | Where-Object { $_ -ieq $key }).Count -gt 0 } else { Test-WshSettingsKey $key }
+            if (-not $allowed) { throw 'it is not a Windows Script Host Settings key' }
+            $data = switch ($kind) {
+                'DWord'        { [int]$record.Value }
+                'QWord'        { [int64]$record.Value }
+                'String'       { "$($record.Value)" }
+                'ExpandString' { "$($record.Value)" }
+                default        { throw "value type '$kind' is not supported" }
+            }
+            $item = Get-Item -LiteralPath $key -ErrorAction SilentlyContinue
+            $same = $false
+            if ($item -and $null -ne $item.GetValue('Enabled')) {
+                $same = ("$($item.GetValueKind('Enabled'))" -eq $kind -and "$($item.GetValue('Enabled'))" -eq "$data")
+            }
+            if (-not $same) {
+                if (-not $item) {
+                    # Never create a profile: a key under HKEY_USERS\<SID> needs that
+                    # account's profile loaded, or the value would land nowhere useful.
+                    if ($key -imatch '^Registry::HKEY_USERS\\([^\\]+)\\' -and -not (Test-Path -LiteralPath "Registry::HKEY_USERS\$($Matches[1])")) {
+                        throw "the profile of $($Matches[1]) is not loaded"
+                    }
+                    New-Item -Path $key -Force -ErrorAction Stop | Out-Null
+                }
+                New-ItemProperty -LiteralPath $key -Name 'Enabled' -PropertyType $kind -Value $data -Force -ErrorAction Stop | Out-Null
+                $written++
+                $item = Get-Item -LiteralPath $key -ErrorAction Stop
+                $nowKind = "$($item.GetValueKind('Enabled'))"
+                $now = "$($item.GetValue('Enabled'))"
+                if ($nowKind -ne $kind -or $now -ne "$data") { throw "it reads back as $nowKind '$now', not $kind '$data'" }
+            }
+        } catch {
+            $problems += "${key}: $($_.Exception.Message)"
+        }
+    }
+    return [pscustomobject]@{ Problems = @($problems); Written = $written }
+}
+
+# The WSH values this run turned on and has not yet put back, from the recovery state.
+# None when the run did not change WSH, or has put it back already. Complete-Run calls
+# this on every way out, some before the helpers further down exist, so it uses none.
+function Get-WshRestorePending {
+    $state = $script:RecoveryState
+    if (-not $state) { return @() }
+    $names = @($state.PSObject.Properties.Name)
+    if ($names -notcontains 'WshOriginalValues' -or $names -notcontains 'WshRestored') { return @() }
+    if ([bool]$state.WshRestored) { return @() }
+    return @($state.WshOriginalValues)
+}
+
+# Put back the WSH setting this run changed, and record that it is back. On disk it
+# changes only the WshRestored field of recovery-state.json: never the marker (a finished
+# run has removed it already) and never a stage that failed to save. Returns '' or the
+# problem.
+function Restore-WshForRun {
+    param([string[]] $AllowedKeys = @())
+    $records = @(Get-WshRestorePending)
+    if ($records.Count -eq 0) { return '' }
+    try { $result = Restore-WshSettings -Records $records -AllowedKeys $AllowedKeys }
+    catch { return "the saved Windows Script Host values could not be used: $($_.Exception.Message)" }
+    if (@($result.Problems).Count -gt 0) { return (@($result.Problems) -join ' | ') }
+    Set-RecoveryProperty WshRestored $true
+    try {
+        $statePath = if ($script:RunDir) { Join-Path $script:RunDir 'recovery-state.json' } else { '' }
+        if ($statePath -and (Test-Path -LiteralPath $statePath)) {
+            $text = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop
+            $newText = [regex]::Replace($text, '("WshRestored"\s*:\s*)false', '${1}true')
+            if ($newText -ne $text) {
+                $check = $newText | ConvertFrom-Json -ErrorAction Stop
+                if (-not [bool]$check.WshRestored) { throw 'the changed state does not read back' }
+                Write-AtomicText -Path $statePath -Value $newText.TrimEnd("`r", "`n")
+            }
+        }
+    } catch {
+        # Harmless: a later -Recover finds the values already back and writes nothing.
+        Write-Log "Windows Script Host is off again, but the recovery state could not record it: $($_.Exception.Message)" WARN
+    }
+    $keys = @($records | ForEach-Object { "$($_.Key)" }) -join ', '
+    if ($result.Written -gt 0) {
+        $script:Report.WshStatus = 'RESTORED'
+        Write-Log "Windows Script Host is turned off again, with the exact values saved before the PostgreSQL installer ran ($keys)" OK
+    } else {
+        Write-Log "Windows Script Host already holds the values saved before the PostgreSQL installer ran ($keys). Nothing to put back." OK
+    }
+    return ''
+}
+
+# The commands an operator runs to turn WSH off again by hand, as in Veeam KB4699. The
+# keys are HKLM and HKEY_USERS\<SID> paths, so any elevated account can run them.
+function Get-WshManualRestoreAction {
+    param([AllowEmptyCollection()][object[]] $Records = @())
+    $commands = @()
+    try {
+        $commands = @($Records | ForEach-Object {
+            "New-ItemProperty -Path '$($_.Key)' -Name 'Enabled' -PropertyType $($_.Kind) -Value '$($_.Value)' -Force"
+        })
+    } catch { $commands = @() }
+    if ($commands.Count -eq 0) {
+        return 'Turn Windows Script Host off again once the PostgreSQL installer has exited, using the values recorded as WshOriginalValues in RecoveryRunDir\recovery-state.json (Veeam KB4699).'
+    }
+    return "Turn Windows Script Host off again once the PostgreSQL installer has exited (Veeam KB4699). In an elevated PowerShell, run: $($commands -join '; ')"
+}
+
 # The stage notes in Complete-Run describe only what was rolled back. A run can also
 # start a stopped automatic Veeam service (STEP 14), close an open Veeam console (the
 # waits), or remove a leftover Enterprise Manager registry key (STEP 3). Add each one
@@ -2529,6 +2736,23 @@ function Complete-Run {
     )
     if ($script:Exiting) { return }
     $script:Exiting = $true
+
+    # Windows Script Host: put back what this run turned on for the PostgreSQL installer,
+    # on every way out. Not while the installer still runs: it would fail part-way. This
+    # must never stop the summary, so any error only leaves WSH reported as still on.
+    $wshLeftOn = ''
+    $wshRecords = @()
+    try { $wshRecords = @(Get-WshRestorePending) } catch {}
+    if ($wshRecords.Count -gt 0) {
+        try {
+            $installerLeft = @(Get-Process -Name 'postgresql-*-windows-x64' -ErrorAction SilentlyContinue)
+            if ($installerLeft.Count -gt 0) {
+                $wshLeftOn = "the PostgreSQL installer is still running (PID $(@($installerLeft | ForEach-Object { $_.Id }) -join ', ')) and needs it"
+            } else {
+                $wshLeftOn = Restore-WshForRun
+            }
+        } catch { $wshLeftOn = "$($_.Exception.Message)" }
+    }
 
     $finalCode = $Code
     $stateNote = ''
@@ -2593,7 +2817,7 @@ function Complete-Run {
         }
         'INSTALLING' {
             $stateNote = "SERVER IS MID-CHANGE. Veeam services are STOPPED and jobs are DISABLED. Backups are in $($script:RunDir). The changes-in-progress marker is deliberately left in place."
-            if (-not $Recover) { $stateNote += ' Run this script with -Recover: it finishes the update when PostgreSQL is healthy at the target version, and changes nothing otherwise.' }
+            if (-not $Recover) { $stateNote += ' Run this script with -Recover: it finishes the update when PostgreSQL is healthy at the target version. Otherwise it changes no service, job or PostgreSQL state, and only turns Windows Script Host off again if this run left it on.' }
             if ($finalCode -lt $EXIT.ESCALATE) { $finalCode = $EXIT.ESCALATE }
         }
         'VERIFIED' {
@@ -2607,6 +2831,27 @@ function Complete-Run {
     }
 
     $stateNote = Add-RunSideEffectNotes -StateNote $stateNote -Report $script:Report
+
+    # A security setting left changed needs a person, whatever else the run did. The
+    # run's own failure keeps its IssueCode: WSH_LEFT_ON names the issue only when the
+    # run itself succeeded.
+    if ($wshLeftOn) {
+        $script:Report.WshStatus = 'LEFT_ON'
+        try { Write-Log "Windows Script Host was turned on for the PostgreSQL installer and is still on: $wshLeftOn" ERROR } catch {}
+        $stateNote = (@($stateNote, "Windows Script Host was turned on for the PostgreSQL installer and is still on ($(Format-ShortText $wshLeftOn 200)).") | Where-Object { $_ }) -join ' '
+        $codeBeforeWsh = $finalCode
+        if ($finalCode -lt $EXIT.ESCALATE) { $finalCode = $EXIT.ESCALATE }
+        if (-not $script:Report.IssueCode) {
+            $script:Report.IssueCode = if ($codeBeforeWsh -lt $EXIT.RETRY) { 'WSH_LEFT_ON' } else { $Outcome }
+        }
+        $wshAction = 'Turn Windows Script Host off again once the PostgreSQL installer has exited, using the values recorded as WshOriginalValues in RecoveryRunDir\recovery-state.json (Veeam KB4699).'
+        try { $wshAction = Get-WshManualRestoreAction -Records $wshRecords } catch {}
+        $baseAction = "$($script:Report.ActionRequired)"
+        if (-not $baseAction) { $baseAction = Get-RmmActionForExitCode $codeBeforeWsh }
+        $script:Report.ActionRequired = if ($baseAction -eq 'None') { $wshAction } else { "$baseAction $wshAction" }
+    } elseif ($wshRecords.Count -gt 0 -and "$($script:Report.WshStatus)" -eq 'RESTORED') {
+        $stateNote = (@($stateNote, 'Windows Script Host was turned off again, with the values saved before the PostgreSQL installer ran.') | Where-Object { $_ }) -join ' '
+    }
 
     # A NATS update that ended early: say how far NATS got.
     if ($script:Report.Contains('NatsStatus') -and "$($script:Report['NatsStatus'])" -eq 'UPDATING') {
@@ -4603,7 +4848,8 @@ function Invoke-ExplicitRecovery {
         # mid-change. When PostgreSQL PROVES it is healthy at the target
         # version and nobody has started finishing by hand, do what that run would
         # have done next: tuning, Veeam services, jobs. Anything less certain stays
-        # diagnostic-only and changes nothing.
+        # diagnostic-only and changes no service, job or PostgreSQL state (Complete-Run
+        # still turns Windows Script Host off again if the interrupted run left it on).
         $finishBlockers = @()
         $finishTarget = "$(Get-CfgValue $state 'TargetVersion' '')"
         try { $finishTargetNum = [int](ConvertTo-ServerVersionNum $finishTarget) } catch { $finishTargetNum = 0 }
@@ -4627,7 +4873,7 @@ function Invoke-ExplicitRecovery {
             Write-Log "The installer finished and PostgreSQL is healthy at the target version $finishTarget. Finishing the run: mandatory tuning, then Veeam services, then jobs." WARN
         } else {
             $script:Report.IssueCode = 'POST_INSTALL_RECOVERY_REQUIRES_OPERATOR'
-            $script:Report.ActionRequired = 'PAGE AN OPERATOR. The installer may have started; recovery was diagnostic-only and no state was changed.'
+            $script:Report.ActionRequired = 'PAGE AN OPERATOR. The installer may have started; recovery was diagnostic-only and changed no service, job or PostgreSQL state.'
             $code = if ($emergency) { $EXIT.ESCALATE_NOW } else { $EXIT.ESCALATE }
             Complete-Run $code 'RECOVERY_DIAGNOSTIC_ONLY' "InstallerStarted=True. $($diagnostics -join '; '). Not finished automatically because $($finishBlockers -join '; '). Inspect installer logs, validate PostgreSQL, and use the recorded state to decide whether any service/job restoration is still required."
         }
@@ -5976,15 +6222,23 @@ if ($natsDue) {
 # ---------------------------------------------------------------------------
 Write-Log 'STEP 9 - Environment pre-flight' STEP
 
-# Windows Script Host must not be disabled (Veeam KB4698)
-foreach ($wshKey in @('HKLM:\SOFTWARE\Microsoft\Windows Script Host\Settings',
-                      'HKCU:\Software\Microsoft\Windows Script Host\Settings')) {
-    $wshEnabled = Get-RegValue $wshKey 'Enabled'
-    if ($null -ne $wshEnabled -and [int]$wshEnabled -eq 0) {
-        Complete-Run $EXIT.PREFLIGHT 'WSH_DISABLED' "Windows Script Host is disabled at $wshKey. The PostgreSQL installer will fail part-way through (Veeam KB4698). Re-enable it first."
+# Windows Script Host. The installer fails part-way without it (Veeam KB4698), and
+# Veeam's hardening advice turns it off on purpose. So it is reported here, never a
+# reason to stop: -Install turns it on only while the installer runs (STEP 17), then
+# puts back the exact setting, as Veeam KB4699 describes. No restart is needed.
+$wshOff = @(Get-WshDisabledValues)
+if ($wshOff.Count -gt 0) {
+    $script:Report.WshStatus = 'DISABLED'
+    # Find out now, not after the outage, if this account cannot change the setting.
+    $wshWriteProblems = @(Get-WshWriteProblems -Records $wshOff)
+    if ($wshWriteProblems.Count -gt 0) {
+        Complete-Run $EXIT.PREFLIGHT 'WSH_NOT_WRITABLE' "Windows Script Host is turned off, and this account cannot turn it on: $(Format-ShortText ($wshWriteProblems -join ' | ') 300). The PostgreSQL installer fails part-way without it (Veeam KB4698). Give this account write access to the key, or turn Windows Script Host on for the install (Veeam KB4699)."
     }
+    Write-Log "Windows Script Host is turned off at $(@($wshOff | ForEach-Object { $_.Key }) -join ' and '), as Veeam's hardening advises. The PostgreSQL installer needs it (Veeam KB4698), so -Install turns it on only while the installer runs, then turns it off again (Veeam KB4699). No restart is needed." WARN
+} else {
+    $script:Report.WshStatus = 'ENABLED'
+    Write-Log 'Windows Script Host is enabled' OK
 }
-Write-Log 'Windows Script Host is enabled' OK
 
 # Visual C++ 2015-2022 redistributable (the installer helper needs it)
 $vcOk = $false
@@ -6791,6 +7045,24 @@ Write-Log "Cold copy written to $coldCopy (robocopy exit $($rc.ExitCode))" OK
 Write-Log 'STEP 17 - Run the PostgreSQL installer' STEP
 Set-RecoveryProperty BackupDirectory $backupDir
 Set-RecoveryProperty ColdCopyDirectory $coldCopy
+
+# Windows Script Host: the installer needs it (Veeam KB4698). If Veeam's hardening turned
+# it off, turn it on for the installer only, as Veeam KB4699 says. Read it again here,
+# because STEP 9 may have been hours ago. Save the exact values before the change, so
+# this run, its rollback and -Recover can always put them back.
+$wshRecords = @(Get-WshDisabledValues)
+if ($wshRecords.Count -gt 0) {
+    Set-RecoveryProperty WshOriginalValues @($wshRecords)
+    Set-RecoveryProperty WshRestored $false
+    Save-RecoveryState -Stage 'SERVICES_STOPPED' -InstallerStarted $false
+    try { Enable-WshForInstaller -Records $wshRecords }
+    catch {
+        Complete-Run $EXIT.PREFLIGHT 'WSH_ENABLE_FAILED' "Could not turn Windows Script Host on for the PostgreSQL installer: $($_.Exception.Message). PostgreSQL was NOT modified."
+    }
+    Write-Log "Windows Script Host turned on for the installer at $(@($wshRecords | ForEach-Object { $_.Key }) -join ' and '). It is turned off again as soon as the installer exits." WARN
+} else {
+    $script:Report.WshStatus = 'ENABLED'
+}
 Save-RecoveryState -Stage 'INSTALLING' -InstallerStarted $true
 Write-Log "Recovery marker updated: $($script:MarkerFile)" WARN
 
@@ -6839,6 +7111,11 @@ foreach ($tempDir in @($env:TEMP, 'C:\Windows\Temp')) {
     }
 }
 Write-Log "Installer logs collected into $($script:RunDir)"
+
+# The installer has exited, so turn Windows Script Host off again now, whatever the
+# result. If that fails, the end of the run tries again and reports WshStatus=LEFT_ON.
+$wshProblem = Restore-WshForRun
+if ($wshProblem) { Write-Log "Could not turn Windows Script Host off again yet: $wshProblem. The end of the run tries again." WARN }
 
 if ($null -ne $installerExit -and $installerExit -ne 0) {
     Complete-Run $EXIT.ESCALATE 'INSTALLER_FAILED' "Installer exited $installerExit."
@@ -7154,8 +7431,14 @@ if ($natsDue) { $doneMsg += " NATS $($natsDiscovery.Installed) -> $($natsDiscove
 $successCode = Get-PolicyExitCode -Eol $script:EolBranch -UpdateAvailable $false -RebootRequired $true
 if ($Reboot) {
     # The restart is booked last, right before the summary, so the delay covers the
-    # few seconds this run still needs and the RMM's collection of its output.
-    $restart = Invoke-DelayedReboot -DelaySeconds $RebootDelaySeconds -Vbr $hasVbr -Vb365 $hasVb365
+    # few seconds this run still needs and the RMM's collection of its output. A run
+    # that could not turn Windows Script Host off again is not fully successful.
+    $wshBeforeRestart = Restore-WshForRun
+    $restart = if ($wshBeforeRestart) {
+        [pscustomobject]@{ Scheduled = $false; At = $null; Reason = "Windows Script Host could not be turned off again ($(Format-ShortText $wshBeforeRestart 300))" }
+    } else {
+        Invoke-DelayedReboot -DelaySeconds $RebootDelaySeconds -Vbr $hasVbr -Vb365 $hasVb365
+    }
     if ($restart.Scheduled) {
         $at = $restart.At.ToString('HH:mm:ss')
         Write-Log "Server restart booked for $at ($RebootDelaySeconds seconds from now). To cancel it: shutdown /a" WARN
@@ -7172,6 +7455,11 @@ if ($Reboot) {
         Complete-Run $bookedCode 'UPDATED_REBOOT_SCHEDULED' "$doneMsg The server restarts at $at, as -Reboot asked. After it is back, rerun the audit."
     }
     Write-Log "-Reboot was requested, but no restart was booked: $($restart.Reason)." WARN
+    if ($wshBeforeRestart) {
+        # Complete-Run tries once more. It then names Windows Script Host as the issue
+        # (WshStatus=LEFT_ON) or says it is off again; either way the RMM reboots.
+        Complete-Run $successCode 'UPDATED_REBOOT_NOT_SCHEDULED' "$doneMsg -Reboot booked no restart because Windows Script Host could not be turned off again. Reboot through the RMM, verify LastBootUpTime, then rerun audit."
+    }
     $script:Report.IssueCode = 'REBOOT_NOT_SCHEDULED'
     # Keep the policy action for this exit code, so an EOL run (exit 8) still asks
     # for the major-version migration ticket.

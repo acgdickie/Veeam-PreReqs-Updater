@@ -9,7 +9,8 @@
 # Veeam cmdlets and every call that would change a service or process are faked, so no
 # Veeam, PostgreSQL or network is needed. A few harmless real calls remain (Get-Process,
 # Get-Service lookups, cmd.exe, reg.exe). Only throw-away items named with the PID are
-# created (folders, a .reg file, two HKCU:\Software keys), and removed again.
+# created (folders, a .reg file, three HKCU:\Software keys), and removed again. The real
+# Windows Script Host keys are never written: those tests use their own HKCU keys.
 #
 # Why it exists: VBR 12 runs on Windows PowerShell 5.1 and VBR 13 on PowerShell 7,
 # and some bugs appear on one edition only (a lost installer exit code, JSON lists
@@ -56,7 +57,8 @@ $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
         'Wait-NatsInfoVersion','Get-NatsClientSummary','Test-NatsStorePathSafe','Test-NatsZipEntryNames','Expand-NatsPackage',
         'Get-FileSha256','Get-NatsDiscovery','Set-NatsStage','Set-NatsServicePath','Stop-ServiceAndWait','Test-NatsRunningAt',
         'Restore-NatsStore','Restore-NatsInstallation','Get-NatsManualRevertAction','Stop-ServicesInOrder','Get-NatsRunFacts',
-        'Invoke-NatsWebText','ConvertFrom-VeeamNatsRequirementsHtml','Get-NatsSupportedVersions','ConvertFrom-NatsSha256Sums','Resolve-NatsPackageSha256'
+        'Invoke-NatsWebText','ConvertFrom-VeeamNatsRequirementsHtml','Get-NatsSupportedVersions','ConvertFrom-NatsSha256Sums','Resolve-NatsPackageSha256',
+        'Get-WshSettingsKeys','Test-WshSettingsKey','Get-WshDisabledValues','Get-WshWriteProblems','Enable-WshForInstaller','Restore-WshSettings','Get-WshRestorePending','Restore-WshForRun','Get-WshManualRestoreAction'
 foreach ($fn in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
     if ($want -contains $fn.Name) { . ([scriptblock]::Create($fn.Extent.Text)) }
 }
@@ -155,8 +157,8 @@ $shutdownOwners = @($ast.FindAll({ param($n) $n -is [System.Management.Automatio
 Check 'shutdown.exe is used in one place only'   (@($shutdownOwners | Sort-Object -Unique) -join ',') 'Invoke-DelayedReboot'
 $delayedRebootCalls = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Invoke-DelayedReboot' }, $true))
 Check 'the restart is booked from one place'     $delayedRebootCalls.Count 1
-Check 'the restart is booked only under -Reboot' ($scriptText -match '(?s)if \(\$Reboot\) \{\s+# The restart is booked last.*?\$restart = Invoke-DelayedReboot -DelaySeconds \$RebootDelaySeconds') 'True'
-Check 'the restart is booked after the marker is gone' ($scriptText.IndexOf('$restart = Invoke-DelayedReboot') -gt $scriptText.IndexOf("Save-RecoveryState -Stage 'COMPLETE' -InstallerStarted `$true")) 'True'
+Check 'the restart is booked only under -Reboot' ($scriptText -match '(?s)if \(\$Reboot\) \{\s+# The restart is booked last.*?\$restart = if .*?Invoke-DelayedReboot -DelaySeconds \$RebootDelaySeconds') 'True'
+Check 'the restart is booked after the marker is gone' ($scriptText.IndexOf('Invoke-DelayedReboot -DelaySeconds $RebootDelaySeconds') -gt $scriptText.IndexOf("Save-RecoveryState -Stage 'COMPLETE' -InstallerStarted `$true")) 'True'
 Check 'reboot delay defaults to 120 seconds'     ($scriptText -match '\[ValidateRange\(30, 3600\)\]\[int\] \$RebootDelaySeconds = 120') 'True'
 Check 'no restart keeps the EOL migration action' ($scriptText -match '\$script:Report\.ActionRequired = "\$\(Get-RmmActionForExitCode \$successCode\) -Reboot booked no restart because') 'True'
 Check 'exit 8 action still asks for migration'   ((Get-RmmActionForExitCode 8) -match 'migration') 'True'
@@ -3257,6 +3259,219 @@ $r2 = Invoke-Native 'cmd.exe' @('/c','echo hello')
 Check 'clean run exit 0'     $r2.ExitCode 0
 Check 'clean run stdout'     $r2.StdOut 'hello'
 Check 'clean run no stderr'  $r2.StdErr ''
+
+'--- Windows Script Host: on for the installer only, then put back exactly (KB4698, KB4699) ---'
+$wshTestRoot = "HKCU:\Software\VpguWshTest-$PID"
+$wshKeyA = "$wshTestRoot\A\Settings"
+$wshKeyB = "$wshTestRoot\B\Settings"
+$wshKeyC = "$wshTestRoot\C\Settings"
+$wshKeyD = "$wshTestRoot\D\Settings"
+$wshTestKeys = @($wshKeyA, $wshKeyB, $wshKeyC, $wshKeyD)
+$wshTemp = Join-Path ([IO.Path]::GetTempPath()) "vpgu-wsh-$PID"
+$wshSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$wshDenyRule = $null
+# Set-Acl cannot find registry keys by literal path, so change the test key's ACL directly.
+function Set-WshTestDeny {
+    param([bool] $Add)
+    $handle = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Software\VpguWshTest-$PID\D\Settings",
+        [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+        [System.Security.AccessControl.RegistryRights]'ChangePermissions, ReadPermissions')
+    try {
+        $acl = $handle.GetAccessControl()
+        if ($Add) { $acl.AddAccessRule($wshDenyRule) } else { [void]$acl.RemoveAccessRule($wshDenyRule) }
+        $handle.SetAccessControl($acl)
+    } finally { $handle.Dispose() }
+}
+$wshPrior = @{}
+foreach ($name in @('Report','RecoveryState','RunDir','MarkerFile')) {
+    $wshPrior[$name] = Get-Variable -Name $name -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+}
+try {
+    Check 'WSH keys: HKLM, and this account by SID (KB4699)' ((Get-WshSettingsKeys) -join '|') "HKLM:\SOFTWARE\Microsoft\Windows Script Host\Settings|Registry::HKEY_USERS\$wshSid\Software\Microsoft\Windows Script Host\Settings"
+    Check 'no keys: nothing is off'            @(Get-WshDisabledValues -Keys $wshTestKeys).Count 0
+    foreach ($k in $wshTestKeys) { New-Item -Path $k -Force | Out-Null }
+    Check 'HKEY_USERS by SID is the HKCU of this account' (Test-Path -LiteralPath "Registry::HKEY_USERS\$wshSid\Software\VpguWshTest-$PID\A\Settings") 'True'
+
+    # Restores read their keys from a file, so only the two WSH keys may ever be written.
+    Check 'allowed: the HKLM key'              (Test-WshSettingsKey 'HKLM:\SOFTWARE\Microsoft\Windows Script Host\Settings') 'True'
+    Check 'allowed: a user key by SID'         (Test-WshSettingsKey 'Registry::HKEY_USERS\S-1-5-18\Software\Microsoft\Windows Script Host\Settings') 'True'
+    Check 'refused: HKCU (it depends on who runs -Recover)' (Test-WshSettingsKey 'HKCU:\Software\Microsoft\Windows Script Host\Settings') 'False'
+    Check 'refused: any other key'             (Test-WshSettingsKey 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run') 'False'
+    Check 'refused: a longer path'             (Test-WshSettingsKey 'Registry::HKEY_USERS\S-1-5-18\Software\Microsoft\Windows Script Host\Settings\Extra') 'False'
+    Check 'refused: empty'                     (Test-WshSettingsKey '') 'False'
+    Check 'refused: a trailing line break'     (Test-WshSettingsKey "Registry::HKEY_USERS\S-1-5-18\Software\Microsoft\Windows Script Host\Settings`n") 'False'
+    Check 'allowed: .DEFAULT, for a profile that is not loaded' (Test-WshSettingsKey 'Registry::HKEY_USERS\.DEFAULT\Software\Microsoft\Windows Script Host\Settings') 'True'
+    Check 'refused: another hive name'         (Test-WshSettingsKey 'Registry::HKEY_USERS\S-1-5-18_Classes\Software\Microsoft\Windows Script Host\Settings') 'False'
+    $wshKeysText = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Get-WshSettingsKeys' }, $true))[0].Extent.Text
+    Check 'an unloaded profile falls back to .DEFAULT, as Windows does' ($wshKeysText -match [regex]::Escape("else { '.DEFAULT' }")) 'True'
+
+    New-ItemProperty -LiteralPath $wshKeyA -Name Enabled -PropertyType DWord -Value 0 | Out-Null
+    New-ItemProperty -LiteralPath $wshKeyB -Name Enabled -PropertyType String -Value '0' | Out-Null
+    New-ItemProperty -LiteralPath $wshKeyC -Name Enabled -PropertyType DWord -Value 1 | Out-Null
+    $wshOff = @(Get-WshDisabledValues -Keys @($wshKeyA, $wshKeyB, $wshKeyC))
+    Check 'two values turn WSH off'            $wshOff.Count 2
+    Check 'Enabled=1 is not off'               @($wshOff | Where-Object { $_.Key -eq $wshKeyC }).Count 0
+    Check 'DWord record'                       "$($wshOff[0].Key) $($wshOff[0].Kind) $($wshOff[0].Value)" "$wshKeyA DWord 0"
+    Check 'String record'                      "$($wshOff[1].Kind) $($wshOff[1].Value)" 'String 0'
+    Check 'write check: these keys can be changed' @(Get-WshWriteProblems -Records $wshOff).Count 0
+
+    Enable-WshForInstaller -Records $wshOff -Keys $wshTestKeys
+    Check 'enable: nothing is off now'         @(Get-WshDisabledValues -Keys $wshTestKeys).Count 0
+    Check 'enable deletes the value (KB4699)'  "[$(Get-RegValue $wshKeyA 'Enabled')][$(Get-RegValue $wshKeyB 'Enabled')]" '[][]'
+    Check 'enable leaves other values alone'   (Get-RegValue $wshKeyC 'Enabled') 1
+
+    # The records reach -Recover through recovery-state.json, so restore them from JSON.
+    $wshJson = @((ConvertTo-Json -InputObject ([pscustomobject]@{ WshOriginalValues = @($wshOff) }) -Depth 8 | ConvertFrom-Json).WshOriginalValues)
+    $wshResult = Restore-WshSettings -Records $wshJson -AllowedKeys $wshTestKeys
+    Check 'restore from JSON: no problems, two written' "$(@($wshResult.Problems).Count) $($wshResult.Written)" '0 2'
+    $itemA = Get-Item -LiteralPath $wshKeyA
+    $itemB = Get-Item -LiteralPath $wshKeyB
+    Check 'restore: DWord 0 exactly'           "$($itemA.GetValueKind('Enabled')) $($itemA.GetValue('Enabled'))" 'DWord 0'
+    Check 'restore: String 0 exactly'          "$($itemB.GetValueKind('Enabled')) $($itemB.GetValue('Enabled'))" 'String 0'
+    Check 'restored values turn WSH off again' @(Get-WshDisabledValues -Keys $wshTestKeys).Count 2
+    $wshAgain = Restore-WshSettings -Records $wshJson -AllowedKeys $wshTestKeys
+    Check 'restore again writes nothing'       "$(@($wshAgain.Problems).Count) $($wshAgain.Written)" '0 0'
+
+    Remove-ItemProperty -LiteralPath $wshKeyA -Name Enabled
+    Check 'restore refuses a key that is not a WSH key' ((@((Restore-WshSettings -Records @($wshOff[0])).Problems) -join ' ') -match 'not a Windows Script Host Settings key') 'True'
+    Check 'a refused key is not written'       "[$(Get-RegValue $wshKeyA 'Enabled')]" '[]'
+    $wshBinary = [pscustomobject]@{ Key = $wshKeyA; Kind = 'Binary'; Value = 0 }
+    Check 'restore refuses other value types'  ((@((Restore-WshSettings -Records @($wshBinary) -AllowedKeys $wshTestKeys).Problems) -join ' ') -match "value type 'Binary'") 'True'
+    Check 'unreadable records are problems, not errors' @((Restore-WshSettings -Records @($null, [pscustomobject]@{ Foo = 1 }, 'x') -AllowedKeys $wshTestKeys).Problems).Count 3
+    $wshNoProfile = [pscustomobject]@{ Key = 'Registry::HKEY_USERS\S-1-5-21-1-2-3-4242\Software\Microsoft\Windows Script Host\Settings'; Kind = 'DWord'; Value = 0 }
+    Check 'a profile that is not loaded is never created' ((@((Restore-WshSettings -Records @($wshNoProfile)).Problems) -join ' ') -match 'not loaded') 'True'
+    Check 'and nothing was written for it'     (Test-Path -LiteralPath 'Registry::HKEY_USERS\S-1-5-21-1-2-3-4242') 'False'
+    Remove-Item -LiteralPath "$wshTestRoot\A" -Recurse -Force
+    $wshRecreated = Restore-WshSettings -Records @($wshOff[0]) -AllowedKeys $wshTestKeys
+    Check 'restore re-creates a deleted key'   "$(@($wshRecreated.Problems).Count) $($wshRecreated.Written)" '0 1'
+    Check 'the re-created value is back'       (Get-RegValue $wshKeyA 'Enabled') 0
+
+    # A key this account may not change: STEP 9 must say so before the outage, and a value
+    # that was never changed must not need write access to count as put back.
+    New-ItemProperty -LiteralPath $wshKeyD -Name Enabled -PropertyType DWord -Value 0 | Out-Null
+    $wshDenyRule = [System.Security.AccessControl.RegistryAccessRule]::new(
+        [Security.Principal.SecurityIdentifier]$wshSid,
+        [System.Security.AccessControl.RegistryRights]::SetValue,
+        [System.Security.AccessControl.AccessControlType]::Deny)
+    Set-WshTestDeny -Add $true
+    $wshD = @(Get-WshDisabledValues -Keys @($wshKeyD))
+    Check 'write check names a key this account cannot change' ((@(Get-WshWriteProblems -Records $wshD) -join ' ') -like "*$wshKeyD*") 'True'
+    Check 'write check: an unknown path is a problem' @(Get-WshWriteProblems -Records @([pscustomobject]@{ Key = 'C:\Windows' })).Count 1
+    Check 'enabling it fails, as the write check said' (Throws { Enable-WshForInstaller -Records $wshD -Keys @($wshKeyD) }) 'True'
+    $wshDResult = Restore-WshSettings -Records $wshD -AllowedKeys $wshTestKeys
+    Check 'a value that already matches needs no write access' "$(@($wshDResult.Problems).Count) $($wshDResult.Written)" '0 0'
+    Set-WshTestDeny -Add $false
+    $wshDenyRule = $null
+    Remove-ItemProperty -LiteralPath $wshKeyD -Name Enabled
+
+    # The run-level pieces: pending values come only from the recovery state, and the
+    # restore records itself in the state file but never writes the marker.
+    New-Item -ItemType Directory -Path $wshTemp -Force | Out-Null
+    $wshStatePath = Join-Path $wshTemp 'recovery-state.json'
+    $script:RunDir = $wshTemp
+    $script:MarkerFile = Join-Path $wshTemp 'CHANGES-IN-PROGRESS.marker'
+    $script:Report = [ordered]@{ WshStatus = 'DISABLED' }
+    $script:RecoveryState = $null
+    Check 'pending: none without a recovery state'      @(Get-WshRestorePending).Count 0
+    $script:RecoveryState = [pscustomobject]@{ Stage = 'SERVICES_STOPPED'; InstallerStarted = $false }
+    Check 'pending: none when the run did not change WSH' @(Get-WshRestorePending).Count 0
+    Set-RecoveryProperty WshOriginalValues @($wshOff)
+    Check 'pending: none without WshRestored=False'      @(Get-WshRestorePending).Count 0
+    Set-RecoveryProperty WshRestored $false
+    Check 'pending: the recorded values'                @(Get-WshRestorePending).Count 2
+    # As STEP 17 does: the values reach the disk before WSH is turned on. Then a stage
+    # change that failed to save stays in memory only.
+    Write-AtomicJson -Path $wshStatePath -InputObject $script:RecoveryState
+    Set-RecoveryProperty Stage 'INSTALLING'
+    Set-RecoveryProperty InstallerStarted $true
+    Enable-WshForInstaller -Records $wshOff -Keys $wshTestKeys
+    Check 'run restore: no problem'            (Restore-WshForRun -AllowedKeys $wshTestKeys) ''
+    Check 'run restore: WSH is off again'      @(Get-WshDisabledValues -Keys @($wshKeyA, $wshKeyB, $wshKeyC)).Count 2
+    Check 'run restore: WshStatus=RESTORED'    $script:Report.WshStatus 'RESTORED'
+    $wshState = Get-Content -LiteralPath $wshStatePath -Raw | ConvertFrom-Json
+    Check 'run restore: the state file says so' $wshState.WshRestored 'True'
+    Check 'run restore: an unsaved stage stays unsaved' "$($wshState.Stage) $($wshState.InstallerStarted)" 'SERVICES_STOPPED False'
+    Check 'run restore: never writes the marker' (Test-Path -LiteralPath $script:MarkerFile) 'False'
+    Check 'run restore: nothing pending after' @(Get-WshRestorePending).Count 0
+    Check 'run restore again: nothing to do'   (Restore-WshForRun -AllowedKeys $wshTestKeys) ''
+    # Values the run never changed: nothing is written, so it does not claim RESTORED.
+    $script:Report.WshStatus = 'DISABLED'
+    Set-RecoveryProperty WshRestored $false
+    Check 'unchanged values: no problem'       (Restore-WshForRun -AllowedKeys $wshTestKeys) ''
+    Check 'unchanged values are not called RESTORED' $script:Report.WshStatus 'DISABLED'
+    # Read back the way -Recover does: the saved records must survive the state file.
+    $script:RecoveryState = $wshState
+    Set-RecoveryProperty WshRestored $false
+    $wshFromFile = @(Get-WshRestorePending)
+    Check 'state file keeps the records'       "$($wshFromFile.Count) $($wshFromFile[0].Kind) $($wshFromFile[1].Kind) $($wshFromFile[0].Key)" "2 DWord String $wshKeyA"
+    # A refused restore is reported and stays pending, so the end of the run tries again.
+    Check 'run restore refused: names the problem' ((Restore-WshForRun) -match 'not a Windows Script Host Settings key') 'True'
+    Check 'run restore refused: still pending' @(Get-WshRestorePending).Count 2
+    # A damaged state file is a problem to report, never an error that loses the summary.
+    $script:RecoveryState = [pscustomobject]@{ WshOriginalValues = @('x'); WshRestored = $false }
+    Check 'unreadable saved values: a problem, not an error' ((Restore-WshForRun) -ne '') 'True'
+    $script:RecoveryState = [pscustomobject]@{ WshOriginalValues = $null; WshRestored = $false }
+    Check 'missing saved values: a problem, not an error' ((Restore-WshForRun) -ne '') 'True'
+
+    $wshAction = Get-WshManualRestoreAction -Records @([pscustomobject]@{ Key = 'HKLM:\SOFTWARE\Microsoft\Windows Script Host\Settings'; Kind = 'DWord'; Value = 0 })
+    Check 'manual action: the KB4699 command'  ($wshAction -like "*New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows Script Host\Settings' -Name 'Enabled' -PropertyType DWord -Value '0' -Force*") 'True'
+    Check 'manual action: any elevated account can run it' ($wshAction -match 'In an elevated PowerShell, run:') 'True'
+    $wshActionHku = Get-WshManualRestoreAction -Records @([pscustomobject]@{ Key = 'Registry::HKEY_USERS\S-1-5-18\Software\Microsoft\Windows Script Host\Settings'; Kind = 'DWord'; Value = 0 })
+    Check 'manual action: the user key is named by SID' ($wshActionHku -like "*-Path 'Registry::HKEY_USERS\S-1-5-18\Software\Microsoft\Windows Script Host\Settings'*") 'True'
+    Check 'manual action with no records points at the state' ((Get-WshManualRestoreAction) -match 'WshOriginalValues') 'True'
+    Check 'manual action with a broken record still answers' ((Get-WshManualRestoreAction -Records @($null)) -ne '') 'True'
+
+    # The main script: STEP 9 reports and checks write access, STEP 17 turns WSH on only
+    # around the installer, and every way out puts it back unless the installer still runs.
+    $step9 = $scriptText.IndexOf("Write-Log 'STEP 9 - Environment pre-flight' STEP")
+    $writeCheck = $scriptText.IndexOf('Get-WshWriteProblems -Records $wshOff', $step9)
+    $step10 = $scriptText.IndexOf("Write-Log 'STEP 10 - Resolve installer URL' STEP")
+    $step17 = $scriptText.IndexOf("Write-Log 'STEP 17 - Run the PostgreSQL installer' STEP")
+    $saveWsh = $scriptText.IndexOf('Set-RecoveryProperty WshOriginalValues', $step17)
+    $durableSave = $scriptText.IndexOf("Save-RecoveryState -Stage 'SERVICES_STOPPED' -InstallerStarted `$false", $step17)
+    $enableWsh = $scriptText.IndexOf('try { Enable-WshForInstaller', $step17)
+    $installing = $scriptText.IndexOf("Save-RecoveryState -Stage 'INSTALLING' -InstallerStarted `$true", $step17)
+    $startInstaller = $scriptText.IndexOf('$proc = Start-Process -FilePath $installerPath', $step17)
+    $restoreAfter = $scriptText.IndexOf('$wshProblem = Restore-WshForRun', $step17)
+    $failedCheck = $scriptText.IndexOf("'INSTALLER_FAILED'", $step17)
+    Check 'STEP 9 no longer stops because WSH is off' ($scriptText -match "'WSH_DISABLED'") 'False'
+    Check 'STEP 9 reports WshStatus'           ($scriptText -match "WshStatus = 'DISABLED'") 'True'
+    Check 'STEP 9 checks write access before anything changes' ($step9 -gt 0 -and $writeCheck -gt $step9 -and $writeCheck -lt $step10) 'True'
+    Check 'STEP 9 stops early when it cannot'  ($scriptText -match "Complete-Run \`$EXIT\.PREFLIGHT 'WSH_NOT_WRITABLE'") 'True'
+    Check 'STEP 17 saves the values to disk before turning WSH on' ($step17 -gt 0 -and $saveWsh -gt $step17 -and $durableSave -gt $saveWsh -and $durableSave -lt $enableWsh) 'True'
+    Check 'STEP 17 turns WSH on just before the installer' ($enableWsh -lt $installing -and $installing -lt $startInstaller) 'True'
+    Check 'STEP 17 turns WSH off once the installer exits' ($restoreAfter -gt $startInstaller -and $restoreAfter -lt $failedCheck) 'True'
+    $wshBeforeBooking = $scriptText.IndexOf('$wshBeforeRestart = Restore-WshForRun')
+    Check '-Reboot books nothing while WSH is still on' ($wshBeforeBooking -gt $restoreAfter -and $wshBeforeBooking -lt $scriptText.IndexOf('Invoke-DelayedReboot -DelaySeconds $RebootDelaySeconds')) 'True'
+    $wshRebootExit = $scriptText.IndexOf("Complete-Run `$successCode 'UPDATED_REBOOT_NOT_SCHEDULED' `"`$doneMsg -Reboot booked no restart because Windows Script Host", $wshBeforeBooking)
+    Check '-Reboot leaves the WSH issue to Complete-Run' ($wshRebootExit -gt $wshBeforeBooking -and $wshRebootExit -lt $scriptText.IndexOf("`$script:Report.IssueCode = 'REBOOT_NOT_SCHEDULED'", $wshBeforeBooking)) 'True'
+    $completeRunText = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Complete-Run' }, $true))[0].Extent.Text
+    $wshBlock = $completeRunText.IndexOf('Get-WshRestorePending')
+    Check 'every way out puts WSH back'        ($wshBlock -gt 0 -and $wshBlock -lt $completeRunText.IndexOf('switch ($script:Stage)')) 'True'
+    Check 'not while the installer still runs' ($completeRunText -match [regex]::Escape("Get-Process -Name 'postgresql-*-windows-x64'")) 'True'
+    Check 'WSH left on needs a person'         ($completeRunText -match "WshStatus = 'LEFT_ON'" -and $completeRunText -match [regex]::Escape('if ($finalCode -lt $EXIT.ESCALATE) { $finalCode = $EXIT.ESCALATE }')) 'True'
+    Check 'a failed run keeps its own IssueCode' ($completeRunText -match [regex]::Escape('if ($codeBeforeWsh -lt $EXIT.RETRY) { ''WSH_LEFT_ON'' } else { $Outcome }')) 'True'
+    Check 'a failed run keeps its own action'  ($completeRunText -match [regex]::Escape('Get-RmmActionForExitCode $codeBeforeWsh')) 'True'
+    Check 'a broken saved value cannot stop the summary' ($completeRunText -match [regex]::Escape('try { $wshAction = Get-WshManualRestoreAction')) 'True'
+    $restoreRunText = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Restore-WshForRun' }, $true))[0].Extent.Text
+    Check 'the run restore never touches the marker' ($restoreRunText -match 'MarkerFile|Save-RecoveryState') 'False'
+    # Complete-Run can run as early as the WorkRoot check, before later functions exist.
+    $completeRunAt = $scriptText.IndexOf('function Complete-Run {')
+    $wshLate = @('Get-WshSettingsKeys','Test-WshSettingsKey','Restore-WshSettings','Get-WshRestorePending','Restore-WshForRun','Get-WshManualRestoreAction' | Where-Object {
+        $at = $scriptText.IndexOf("function $_ {"); $at -lt 0 -or $at -gt $completeRunAt })
+    Check 'the WSH helpers exist before Complete-Run can run' ($wshLate -join ', ') ''
+    $pendingText = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Get-WshRestorePending' }, $true))[0].Extent.Text
+    Check 'the pending check needs no later helper' ($pendingText -match 'Get-CfgValue') 'False'
+} finally {
+    if ($wshDenyRule) { try { Set-WshTestDeny -Add $false } catch {} }
+    Remove-Item -LiteralPath $wshTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $wshTemp -Recurse -Force -ErrorAction SilentlyContinue
+    foreach ($name in @($wshPrior.Keys)) {
+        if ($null -eq $wshPrior[$name]) { Remove-Variable -Name $name -Scope Script -ErrorAction SilentlyContinue }
+        else { Set-Variable -Name $name -Scope Script -Value $wshPrior[$name] }
+    }
+}
+Check 'the WSH test keys are gone'         (Test-Path -LiteralPath $wshTestRoot) 'False'
 
 ''
 "RESULT: $pass passed, $fail failed"

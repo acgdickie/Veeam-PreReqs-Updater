@@ -87,8 +87,9 @@ below).
   PostgreSQL and no network. A few harmless real calls remain: `Get-Process` and
   `Get-Service` lookups, `cmd.exe`, `reg.exe`, and the one elevated run of the real script.
 * It creates only throw-away items named with its process ID: folders under `%TEMP%` and
-  `C:\vpgu-wr-test-<PID>`, one `.reg` file under `%TEMP%`, and two registry keys under
-  `HKCU:\Software`. It removes them all again.
+  `C:\vpgu-wr-test-<PID>`, one `.reg` file under `%TEMP%`, and three registry keys under
+  `HKCU:\Software`. It removes them all again. It never writes the real Windows Script Host
+  keys.
 * It also tests the configuration backup check in `Clear-StaleEnterpriseManagerRecord.ps1`,
   the same way: it reads that function out of the tool and runs it against a fake Veeam.
 * It also checks rules that must always hold, by reading the script itself. For example:
@@ -178,7 +179,7 @@ exact values:
 | `11` | Unsupported or excluded topology | Handle manually; do not repeatedly retry as a transient failure |
 | `20` | Pre-flight failed, or a NATS update failed and the old NATS was put back (`NATS_UPDATE_FAILED`) | Investigate before retrying |
 | `30` | EnterpriseDB page, download, size, or signature check failed, or the NATS download or its SHA256 check failed | Investigate the download path; nothing was installed |
-| `40` | **Post-change failure, unhealthy service, mandatory tuning failure, or recovery needs an operator** | **Page an operator and read the RMM issue fields** |
+| `40` | **Post-change failure, unhealthy service, mandatory tuning failure, recovery needs an operator, or Windows Script Host was left turned on (`WshStatus=LEFT_ON`)** | **Page an operator and read the RMM issue fields** |
 | `50` | **PostgreSQL is missing, down, unqueryable, or reports the wrong version after change/tuning/recovery diagnosis** | **Page an operator immediately and use the recovery evidence** |
 
 Failure codes `20`–`50` take precedence over informational EOL/reboot codes. For example,
@@ -195,13 +196,15 @@ look too.
 The console summary and `last-result.json` hold every report field, in this order:
 `Computer`, `Timestamp`, `Mode`, `VeeamProducts`, `PgMajor`, `PgInstalled`, `PgTarget`,
 `PgEol`, `NatsInstalled`, `NatsTarget`, `NatsStatus`, `NatsDetail`, `StaleEmRecord`,
-`Stage`, `Outcome`, `ExitCode`, `RebootRequired`, `RebootScheduledAt`, `IssueCode`,
+`WshStatus`, `Stage`, `Outcome`, `ExitCode`, `RebootRequired`, `RebootScheduledAt`, `IssueCode`,
 `ActionRequired`, `JobsLeftDisabled`, `UnhealthyServices`, `ServicesStarted`,
 `ConsolesClosed`, `Vb365SyncStuck`, `RecoveryRunDir`, `Detail` and `LogPath`. When the run
 has a run folder (`-Install` creates one; `-Recover` uses the interrupted run's), the same
 result is also written to `result.json` there. `StaleEmRecord` is `present` when a leftover
 Enterprise Manager registry key was found, and `removed; backup <path>` after
-`-RemoveStaleEnterpriseManagerRecord` deleted it. `ServicesStarted` lists
+`-RemoveStaleEnterpriseManagerRecord` deleted it. `WshStatus` says what happened to
+Windows Script Host: see [Windows Script Host and Veeam hardening](#windows-script-host-and-veeam-hardening).
+`ServicesStarted` lists
 stopped automatic Veeam services the run started to rescue a failed configuration backup,
 `ConsolesClosed` lists the Veeam consoles it closed, and `Vb365SyncStuck` names any VB365
 organisation whose data sync is stuck: VB365 needs attention there.
@@ -448,6 +451,8 @@ details for the RMM; it never terminates those sessions.
    service settings, config file and message store.
 8. **Updates.** Stops the Veeam services and installs the PostgreSQL update, or switches
    NATS to the new version. One change per run: PostgreSQL first, NATS on the next run.
+   If Veeam's hardening turned Windows Script Host off, it is on only while the
+   PostgreSQL installer runs.
 9. **Checks it worked.** Confirms the new version, applies Veeam's PostgreSQL tuning, and
    starts the Veeam services again.
 10. **Turns the jobs back on** and reports the result for the RMM. After a PostgreSQL
@@ -494,7 +499,7 @@ the RMM summary. See [Exit codes](#exit-codes) and [If it goes wrong](#if-it-goe
 | STEP 6C - Check NATS (VB365 only) | Read-only. Reads the `nats-server` service, its version, config file and message store, VB365's connection to it, Veeam's supported NATS list, and the package SHA256. Fills `NatsInstalled`, `NatsTarget`, `NatsStatus` and `NatsDetail`. | Decides whether a same-line NATS update is due, and whether it can be done safely. Any doubt leaves NATS alone. |
 | STEP 7 - Resolve target version | Reads `postgresql.org/versions.json` and picks the latest minor on the running branch. Flags an end-of-life branch. Blocks any major-version change. | Always the newest fixes, never an upgrade. A feed that cannot be read stops the run instead of guessing. |
 | STEP 8 - Idempotency gate | When PostgreSQL is already current or newer, the run ends here: `ALREADY_CURRENT` or `LOCAL_VERSION_AHEAD`. If a NATS update is due instead, an audit reports it (exit `5` or `9`), and `-Install` takes the NATS path. | Never downgrades, never repeats work, and makes one change per run. |
-| STEP 9 - Environment pre-flight | Checks that Windows Script Host is enabled, that pgAdmin is not running, and that the WorkRoot drive has 400 MB plus twice the data directory plus 1 GB free. | Each of these is a known cause of a failed unattended install (Veeam KB4698 for Windows Script Host). |
+| STEP 9 - Environment pre-flight | Reports whether Windows Script Host is turned off (`WshStatus=DISABLED`), which does not stop the run. If it is off, checks that this account can change it, and stops if not (`WSH_NOT_WRITABLE`, exit `20`, nothing changed). Checks that pgAdmin is not running, and that the WorkRoot drive has 400 MB plus twice the data directory plus 1 GB free. | pgAdmin and low disk space are known causes of a failed unattended install. Windows Script Host is handled in STEP 17: see [Windows Script Host and Veeam hardening](#windows-script-host-and-veeam-hardening). |
 | STEP 10 - Resolve installer URL | Finds the exact Windows x64 installer on EnterpriseDB's file host, then on its download page. An audit skips this with `-SkipDownloadInAudit`. | An installer not published yet is reported (exit `10`, or `7` on an EOL branch) rather than run later from a guessed link. |
 | Audit stops here | Reports the update that is due (exit `5`, or `9` on an EOL branch). | Audit never changes anything. |
 
@@ -508,7 +513,7 @@ the RMM summary. See [Exit codes](#exit-codes) and [If it goes wrong](#if-it-goe
 | STEP 14 - Backups | Runs the VBR configuration backup and judges it (retrying once after starting stopped automatic Veeam services). On VB365, copies `Config.xml` and `Proxy.xml`. Dumps every Veeam database and the roles, checks each dump, and copies the four `.conf` files. | A restore path that does not depend on the update working. |
 | STEP 15 - Disable and stop all Veeam services | Records every Veeam service's startup type and state, then disables and stops them (VB365 Proxy and Service first, the Management Agent last), then NATS. Checks nothing else is connected to PostgreSQL, dumps any cache database VB365 created meanwhile, and stops PostgreSQL. | The update and the cold copy need PostgreSQL offline with no one using it. |
 | STEP 16 - Cold copy of the PostgreSQL data directory | Saves the data directory's permissions, copies the whole stopped data directory, and checks the copy file count and size. | A complete file-level copy to restore from if the installer breaks PostgreSQL. |
-| STEP 17 - Run the PostgreSQL installer | Records that the installer is starting, then runs it unattended with a bounded wait. A timed-out installer is never killed. Collects the installer's logs. | The update itself. From here, automatic rollback is not allowed: only an operator decides. |
+| STEP 17 - Run the PostgreSQL installer | If Windows Script Host is turned off, records its exact setting and turns it on (Veeam KB4699). Records that the installer is starting, then runs it unattended with a bounded wait. A timed-out installer is never killed. Collects the installer's logs, then turns Windows Script Host off again, whatever the result (`WshStatus=RESTORED`). | The update itself. Once the installer starts, automatic rollback is not allowed: only an operator decides. The installer fails part-way without Windows Script Host (Veeam KB4698). |
 | STEP 18 - Verify the update | Starts PostgreSQL if needed and requires it to report the target version. Compares the `.conf` files with the copies from STEP 14. | The installer's exit code alone is never trusted. |
 | STEP 19 - Apply mandatory Veeam PostgreSQL tuning | Applies the tuning SQL from STEP 13, restarts PostgreSQL, and checks it is back at the target version. | Veeam requires its tuning. If it fails, Veeam stays down and jobs stay off for an operator. |
 | STEP 20 - Restore Veeam service state | Puts back every startup type and starts NATS and every service that was running, in dependency order. Waits 90 seconds, then checks every service, PostgreSQL, the broker port 9501 (VBR only), and the Veeam PowerShell connection. | Veeam must be healthy before any job runs again. |
@@ -532,12 +537,13 @@ the RMM summary. See [Exit codes](#exit-codes) and [If it goes wrong](#if-it-goe
 
 | Step | What it does | Why |
 |---|---|---|
-| Recovery (from STEP 2) | Checks that the marker and its recovery state are the script's own and belong together. Then, depending on how far the run got: puts back captured job and service state (installer not started), finishes the run (installer finished and PostgreSQL proven healthy at the target version), puts the old NATS back or finishes a NATS update, or only reports (anything less certain). | Finishes or undoes an interrupted run from its own records, never by guessing. |
+| Recovery (from STEP 2) | Checks that the marker and its recovery state are the script's own and belong together. Then, depending on how far the run got: puts back captured job and service state (installer not started), finishes the run (installer finished and PostgreSQL proven healthy at the target version), puts the old NATS back or finishes a NATS update, or only reports (anything less certain). In every case, if the interrupted run left Windows Script Host turned on and the installer is no longer running, turns it off again. | Finishes or undoes an interrupted run from its own records, never by guessing. |
 
 ### When a run ends
 
 | Step | What it does | Why |
 |---|---|---|
+| Windows Script Host | If the run turned Windows Script Host on and it is still on (for example, the run stopped in STEP 17), turns it off again with its exact old setting. Not while the PostgreSQL installer is still running: it would fail part-way. | A hardened server does not stay less hardened. If it cannot be turned off, the run returns exit `40` with `WshStatus=LEFT_ON`, and `ActionRequired` gives the command. |
 | ROLLBACK | Only after a failure before the installer started (or, on a NATS run, before VB365 was verified on the new version): puts the old NATS back on a NATS run, starts PostgreSQL, NATS and the Veeam services as they were, ends VB365 maintenance mode, turns the jobs back on, and removes the marker. | A failed run leaves the server as it found it. If that does not fully work, the run returns exit `40`. |
 | RMM SUMMARY | Prints the one-line summary and writes `last-result.json` (and `result.json` in the run folder), then releases the lock and exits with the exit code. | The RMM reads the result. See [Exit codes](#exit-codes). |
 
@@ -711,9 +717,62 @@ that starts inside the delay is interrupted by the restart. To keep that window 
 script checks for Veeam work once more just before booking. If a job or restore has started,
 an Explorer is open, that check fails, or `shutdown.exe` cannot book the restart, it books
 no restart (`IssueCode=REBOOT_NOT_SCHEDULED`) and returns
-`Outcome=UPDATED_REBOOT_NOT_SCHEDULED` with exit `6` (or `8`) for the RMM to reboot. An open
+`Outcome=UPDATED_REBOOT_NOT_SCHEDULED` with exit `6` (or `8`) for the RMM to reboot. It also
+books none while Windows Script Host is still on. The end of that run tries once more to
+turn it off: if that works, the run returns exit `6` (or `8`) with `WshStatus=RESTORED`;
+if not, exit `40` with `WshStatus=LEFT_ON` and `IssueCode=WSH_LEFT_ON` (see
+[Windows Script Host and Veeam hardening](#windows-script-host-and-veeam-hardening)). An open
 Veeam console does not stop the restart. The script never restarts after a failed, partial
 or rolled-back run, or when no update was needed.
+
+## Windows Script Host and Veeam hardening
+
+Veeam's Security & Compliance Analyzer advises turning Windows Script Host (WSH) off. The
+PostgreSQL installer needs it: without it, the install fails part-way (Veeam KB4698).
+Veeam's answer is to turn WSH on for the install and off again afterwards, with no restart
+(Veeam KB4699). The script does exactly that, so a hardened server needs no extra step.
+
+* **An audit** reports `WshStatus=DISABLED` and carries on. It changes nothing.
+* **STEP 9** (audit and `-Install`) checks that this account can change the setting. If it
+  cannot, the run stops there with exit `20` (`WSH_NOT_WRITABLE`), before anything changes.
+* **`-Install`** reads the `Enabled` values again in STEP 17, just before the installer
+  starts. It saves each value that turns WSH off (key, type and data) in the run's
+  `recovery-state.json`, deletes it as KB4699 does, and checks that WSH is on. If that
+  fails, the installer never starts: the values are put back and the run rolls back
+  (`WSH_ENABLE_FAILED`, exit `20`).
+* **As soon as the installer exits**, whatever its result, the script writes each saved
+  value back with its exact type and data, and checks it (`WshStatus=RESTORED`). WSH is on
+  for the minutes the installer runs, not for the whole run.
+* **If the run stops before that**, the end of the run puts the values back. A run that is
+  killed outright (for example by an RMM timeout) leaves WSH on, and `-Recover` puts it back.
+* **While the installer is still running** (`INSTALLER_TIMEOUT`), WSH stays on, because
+  turning it off would break the installer. `-Recover` turns it off once the installer has
+  gone.
+* **`-Reboot`** books no restart while WSH is still on.
+
+The script changes only the two values KB4699 names, for the account it runs as (SYSTEM
+under an RMM):
+
+* `HKLM:\SOFTWARE\Microsoft\Windows Script Host\Settings`, value `Enabled`
+* that account's `HKCU:\Software\Microsoft\Windows Script Host\Settings`, value `Enabled`.
+  The script records it as `Registry::HKEY_USERS\<SID>\Software\...`, so a `-Recover` run as
+  another account, and the command in `ActionRequired`, still change the right account's
+  value. An account whose profile is not loaded uses `HKEY_USERS\.DEFAULT` instead, as
+  Windows does (for SYSTEM, `S-1-5-18` is `.DEFAULT`).
+
+A value that already holds the saved type and data is left alone, so the script never
+reports a value it did not change as turned off again.
+
+| `WshStatus` | Meaning |
+|---|---|
+| *(empty)* | The run ended before STEP 9 or took the NATS path. On `-Recover`: the interrupted run had not changed WSH or had already put it back, or `-Recover` refused the marker or its state (then read `WshOriginalValues` and `WshRestored` in its `recovery-state.json`) |
+| `ENABLED` | WSH was on. Nothing to do |
+| `DISABLED` | WSH is off. An audit reports it; `-Install` turns it on for the installer only. An `-Install` run that stopped before STEP 17 also reports it |
+| `RESTORED` | The run turned WSH on for the installer, then turned it off again, exactly as before |
+| `LEFT_ON` | The run turned WSH on and could not turn it off again, or the installer is still running. Exit `40`. `ActionRequired` gives the command, as in KB4699 |
+
+To run the PostgreSQL installer by hand on a hardened server, turn WSH on first, as KB4699
+describes, and off again afterwards.
 
 ## Where the evidence lives
 
@@ -838,11 +897,22 @@ problem and `JobsLeftDisabled` the schedules. The marker stays. Fix the problem,
 **Exit 50** — PostgreSQL is missing, will not start, is not queryable, or reports the wrong
 version after install/tuning, or `-Recover` diagnosed that emergency after the installer
 boundary. In an update failure, Veeam services/schedules are deliberately left down or
-disabled. Diagnostic-only recovery does not change whatever state it found. Use the exact
+disabled. Diagnostic-only recovery does not change any service, job or PostgreSQL state it
+found. It only turns Windows Script Host off again if the interrupted run left it on, so
+turn it on (Veeam KB4699) before you run the PostgreSQL installer by hand. Use the exact
 `Stage`, `UnhealthyServices`, `JobsLeftDisabled`, and `ActionRequired` fields before acting.
 Recovery evidence includes `runs\<timestamp>\backup\datadir\`, its original DACL record in
 `datadir-acl.txt`, and validated logical dumps;
 restoration is always an operator-reviewed operation.
+
+**WshStatus=LEFT_ON** — the run turned Windows Script Host on for the PostgreSQL installer
+and could not turn it off again, or the installer is still running. The exit code is at
+least `40`. `IssueCode` is `WSH_LEFT_ON` when the run itself succeeded; when it failed,
+`IssueCode` names that failure and `ActionRequired` adds the Windows Script Host step. When the
+installer has exited, run the command in `ActionRequired`, or run `-Recover` if the marker
+is still there. The saved values are in `WshOriginalValues` in the run's
+`recovery-state.json`. This alert comes once: when no marker is left, later runs see only
+the live setting, so act on it the first time.
 
 A `CHANGES-IN-PROGRESS.marker` file in the work root blocks every normal audit/install;
 those modes return exit `40`. Do not delete it merely to make the next run proceed.
@@ -861,7 +931,9 @@ Use `-Recover` for an interrupted run:
   then applies the mandatory Veeam tuning, restores the captured service states, and
   re-enables the jobs (`RECOVERED_POSTINSTALL`, exit `0`). It does not report
   `RebootRequired=True`, so schedule the restart Veeam recommends through the RMM. If any
-  check fails it changes nothing and exits as `RECOVERY_DIAGNOSTIC_ONLY`, naming the check.
+  check fails it changes no service, job or PostgreSQL state (it only turns Windows Script
+  Host off again, if the interrupted run left it on) and exits as
+  `RECOVERY_DIAGNOSTIC_ONLY`, naming the check.
   A tuning failure leaves Veeam down, as it does during `-Install`.
 * If active work appears during recovery, it waits naturally; no job or restore is forcibly
   stopped, though an open Veeam console is closed once it is the only thing left blocking.
@@ -1044,6 +1116,10 @@ tested profile that protects every database, proxy, service, and schedule involv
   `SHA256SUMS` from `github.com`, which redirects to `release-assets.githubusercontent.com`.
   The `-Install` download of NATS uses the same two GitHub hosts.
 * **Single-server NATS only.** No cluster, gateway, leaf node, or client on another machine.
+* **Windows Script Host: the registry setting only.** The script handles the `Enabled`
+  values Veeam KB4699 names. An application-control policy (AppLocker, WDAC or Software
+  Restriction Policies) that blocks `wscript.exe` or `cscript.exe` is not detected, and
+  would still make the installer fail.
 * **Pilot first.** VB365 support needs VB365 8.6 or later. The unit tests pass on both
   PowerShell editions. **Pilot each new product, version and PowerShell edition on one
   non-production server before fleet rollout.**
@@ -1054,6 +1130,25 @@ All notable changes, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The project has no version
 numbers, so each entry is the date the change reached GitHub, with its commit IDs. When
 you change a script, add your entry at the top.
+
+### 2026-10-21
+
+#### Changed
+
+* Windows Script Host turned off by Veeam's hardening no longer stops the run. Before, it
+  stopped at STEP 9 (`WSH_DISABLED`, exit `20`). Now `-Install` turns it on only while the
+  PostgreSQL installer runs, then puts back the exact setting, as Veeam KB4699 describes. No
+  restart is needed. See
+  [Windows Script Host and Veeam hardening](#windows-script-host-and-veeam-hardening).
+
+#### Added
+
+* Report field `WshStatus` (`ENABLED`, `DISABLED`, `RESTORED` or `LEFT_ON`).
+* Outcome `WSH_NOT_WRITABLE` (exit `20`, at STEP 9, nothing changed): Windows Script Host
+  is off and this account cannot change it.
+* Outcome `WSH_ENABLE_FAILED` (exit `20`): Windows Script Host could not be turned on, so
+  the installer never started and the run rolled back. Issue code `WSH_LEFT_ON` (exit `40`):
+  it could not be turned off again.
 
 ### 2026-10-20
 
