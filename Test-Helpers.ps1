@@ -618,6 +618,9 @@ $disableBody = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Langu
 $attemptAt = $disableBody.IndexOf('$record.DisableAttempted = $true')
 Check 'disable: the attempt is saved before the Veeam call' ($attemptAt -gt 0 -and $disableBody.IndexOf('Save-DisabledJobState', $attemptAt) -lt $disableBody.IndexOf('-Action Disable', $attemptAt)) 'True'
 Check 'every re-enable logs what really happened' @([regex]::Matches($scriptText, '(?m)^\s*Enable-VeeamJobById \$')).Count 0
+Check 'STEP 6B names application policies that are off' ($scriptText -match [regex]::Escape("Where-Object { `$_.Family -eq 'VBRApplication' -and -not `$_.Enabled }")) 'True'
+# Inside $( ) a \" is not a quote: PowerShell runs it as a command and the message is lost.
+Check 'no \" inside a subexpression'      @([regex]::Matches($scriptText, '\{ \\"')).Count 0
 Check 'configuration backup gets stable ID'  (Get-VeeamJobIdentity ([pscustomobject]@{ Name='Configuration Backup' }) 'VBRConfig') 'VBR-CONFIGURATION-BACKUP'
 Check 'ordinary job without stable ID throws' (Throws { Get-VeeamJobIdentity ([pscustomobject]@{ Name='No ID' }) 'VBRJob' }) 'True'
 

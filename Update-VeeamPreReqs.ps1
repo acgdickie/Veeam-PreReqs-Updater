@@ -3620,6 +3620,13 @@ function Get-VeeamCoreJobScheduleFlag {
     param([Parameter(Mandatory)] $Id)
     try {
         $coreType = 'Veeam.Backup.Core.CBackupJob' -as [type]
+        if (-not $coreType) {
+            # PowerShell 7 resolves type names only in the default load context. A module
+            # that loads Veeam.Backup.Core into its own context still lists it here.
+            $coreType = @([AppDomain]::CurrentDomain.GetAssemblies() | ForEach-Object {
+                try { $_.GetType('Veeam.Backup.Core.CBackupJob', $false) } catch {}
+            } | Where-Object { $_ }) | Select-Object -First 1
+        }
         if (-not $coreType) { return $null }
         $core = $coreType::Find([guid]"$Id")
         if ($null -eq $core -or $core.PSObject.Properties.Name -notcontains 'IsScheduleEnabled') { return $null }
@@ -6323,6 +6330,13 @@ if ($controlValidation.Kind -ne 'OK') {
     Complete-Run $validationCode $controlValidation.IssueCode $controlValidation.Detail
 }
 $script:ManagedJobInventory = @($controlValidation.Inventory)
+# Older versions of this script could leave an application backup policy (SAP HANA,
+# Oracle RMAN) turned off after a failed run, while logging it as re-enabled. A run
+# leaves a policy that is off alone, so name them here for an operator to check.
+$appPoliciesOff = @($script:ManagedJobInventory | Where-Object { $_.Family -eq 'VBRApplication' -and -not $_.Enabled })
+if ($appPoliciesOff.Count -gt 0) {
+    Write-Log "Application backup policies that are turned off: $(@($appPoliciesOff | ForEach-Object { $_.Name }) -join ', '). This run leaves them off. An older version of this script could leave one off by mistake after a failed run: turn back on any that should run." WARN
+}
 try {
     $auditActivity = @(Get-ActiveVeeamWork -Vbr $hasVbr -Vb365 $hasVb365)
 } catch {
@@ -6762,7 +6776,7 @@ try {
     $inventoryAfterDisable = @(Get-VeeamManagedJobInventory -Vbr $hasVbr -Vb365 $hasVb365)
     $unexpectedEnabled = @($inventoryAfterDisable | Where-Object { $_.Enabled })
     if ($unexpectedEnabled.Count -gt 0) {
-        throw "schedule inventory changed during disable; still enabled: $((@($unexpectedEnabled) | ForEach-Object { \"$($_.Family):$($_.Name)\" }) -join ', ')"
+        throw "schedule inventory changed during disable; still enabled: $((@($unexpectedEnabled) | ForEach-Object { "$($_.Family):$($_.Name)" }) -join ', ')"
     }
     $script:ManagedJobInventory = $inventoryAfterDisable
 }
@@ -7106,7 +7120,7 @@ if (Test-OnlyConsoleBlockers @($blockingUi | ForEach-Object { "UI:$($_.ProcessNa
     $blockingUi = @(Get-BlockingVeeamUiProcesses -Vbr $hasVbr -Vb365 $hasVb365)
 }
 if ($blockingUi.Count -gt 0) {
-    Complete-Run $EXIT.RETRY 'VEEAM_UI_OPEN' "A Veeam Explorer, or a Veeam console that could not be closed, is open before service shutdown ($((@($blockingUi) | ForEach-Object { \"$($_.ProcessName):PID$($_.Id)\" }) -join ', ')). Explorers are never closed automatically, because one can be running a restore. Close it and retry."
+    Complete-Run $EXIT.RETRY 'VEEAM_UI_OPEN' "A Veeam Explorer, or a Veeam console that could not be closed, is open before service shutdown ($((@($blockingUi) | ForEach-Object { "$($_.ProcessName):PID$($_.Id)" }) -join ', ')). Explorers are never closed automatically, because one can be running a restore. Close it and retry."
 }
 
 # VB365 order matters: proxy, then service, then REST. Stop every other captured
@@ -7166,7 +7180,7 @@ if ($stopRequestWarnings.Count -gt 0) {
 }
 if ($stillUp.Count -gt 0 -or $newVeeamServices.Count -gt 0 -or $missingVeeamServices.Count -gt 0 -or $natsStillUp -or $notDisabled.Count -gt 0) {
     $issues = @()
-    if ($stillUp.Count -gt 0) { $issues += "still running: $((@($stillUp) | ForEach-Object { \"$($_.Name)=$($_.Status)\" }) -join ', ')" }
+    if ($stillUp.Count -gt 0) { $issues += "still running: $((@($stillUp) | ForEach-Object { "$($_.Name)=$($_.Status)" }) -join ', ')" }
     if ($newVeeamServices.Count -gt 0) { $issues += "service inventory changed after capture: $((@($newVeeamServices) | ForEach-Object { $_.Name }) -join ', ')" }
     if ($missingVeeamServices.Count -gt 0) { $issues += "captured service disappeared: $((@($missingVeeamServices) | ForEach-Object { $_.Name }) -join ', ')" }
     if ($natsStillUp) { $issues += "still running: $natsStillUp" }

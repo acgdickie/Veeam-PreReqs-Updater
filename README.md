@@ -1180,7 +1180,14 @@ you change a script, add your entry at the top.
   `CBackupJob` (`IsScheduleEnabled`), which follows the console; if that cannot be read,
   the run refuses before changing anything. Every rollback and recovery now switches back
   on any job the run tried to turn off, whatever its enabled flag says, and the log says
-  "re-enabled" only when it really switched a job on.
+  "re-enabled" only when it really switched a job on. STEP 6B now names any application
+  backup policy that is turned off, because an older version could leave one off.
+* Three error messages built their list with `\"` inside `$( )`, which PowerShell runs as a
+  command: the job list that stayed on after disabling, the open Veeam Explorers before
+  shutdown, and the services that would not stop. The run still failed safely, but the
+  summary showed a "not recognized" error instead of the names, and the last two ended as
+  `UNHANDLED_ERROR` (exit `40`) instead of `VEEAM_UI_OPEN` (exit `10`) or
+  `SERVICES_WONT_STOP` (exit `20`).
 
 ### 2026-10-21
 
