@@ -1148,6 +1148,11 @@ tested profile that protects every database, proxy, service, and schedule involv
   `SHA256SUMS` from `github.com`, which redirects to `release-assets.githubusercontent.com`.
   The `-Install` download of NATS uses the same two GitHub hosts.
 * **Single-server NATS only.** No cluster, gateway, leaf node, or client on another machine.
+* **Application backup policies use an internal Veeam API.** Whether a SAP HANA, Oracle
+  RMAN or SAP on Oracle policy is enabled is read from `[Veeam.Backup.Core.CBackupJob]`,
+  because the supported cmdlet does not expose it. That was checked on VBR 12.3. Where
+  the type cannot be read (for example if a VBR 13 build does not load it in PowerShell 7),
+  a server with such policies is refused before anything changes.
 * **Windows Script Host: the registry setting only.** The script handles the `Enabled`
   values Veeam KB4699 names. An application-control policy (AppLocker, WDAC or Software
   Restriction Policies) that blocks `wscript.exe` or `cscript.exe` is not detected, and
@@ -1162,6 +1167,20 @@ All notable changes, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The project has no version
 numbers, so each entry is the date the change reached GitHub, with its commit IDs. When
 you change a script, add your entry at the top.
+
+### 2026-10-22
+
+#### Fixed
+
+* SAP HANA, Oracle RMAN and SAP on Oracle backup policies (`Get-VBRApplicationBackupJob`)
+  could not be turned off safely. Their PowerShell object has no enabled property: its
+  `ScheduleEnabled` stays True after `Disable-VBRApplicationBackupJob`. So the run stopped
+  with `JOB_DISABLE_FAILED`, and the rollback skipped the policy it had just turned off,
+  leaving it disabled while logging "re-enabled". The state is now read from Veeam's
+  `CBackupJob` (`IsScheduleEnabled`), which follows the console; if that cannot be read,
+  the run refuses before changing anything. Every rollback and recovery now switches back
+  on any job the run tried to turn off, whatever its enabled flag says, and the log says
+  "re-enabled" only when it really switched a job on.
 
 ### 2026-10-21
 

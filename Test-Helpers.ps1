@@ -40,7 +40,7 @@ $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
         'Get-PolicyExitCode','Get-RmmActionForExitCode','Invoke-DelayedReboot',
         'Resolve-PgInstallerLinkFromHtml',
         'Get-VeeamJobFamilyDefinitions','Get-VeeamJobFamilyDefinition',
-        'Get-VeeamJobEnabledFlag','Get-VeeamJobIdentity','Get-VeeamManagedJobInventory',
+        'Get-VeeamCoreJobScheduleFlag','Get-VeeamJobEnabledFlag','Get-VeeamJobIdentity','Get-VeeamManagedJobInventory',
         'Invoke-VeeamJobTransition','Get-VeeamJobByRecord','Enable-VeeamJobById',
         'Get-ActiveLabelsFromSessions','Get-ActiveVb365OrganizationSyncWork','Get-Vb365QueuedSyncTiming','Write-Vb365StuckSyncOnce','Test-VbrFamilyInUse','Get-BlockingVeeamUiProcesses',
         'Get-ActiveVeeamWork','Wait-VeeamIdle','Find-Vb365MaintenanceBarrier','Start-Vb365MaintenanceBarrier',
@@ -583,6 +583,41 @@ Check 'missing enabled property fails closed' (Throws { Get-VeeamJobEnabledFlag 
 $policyDef = [pscustomobject]@{ Family='VBRCDP'; Enabled=@('PolicyState') }
 Check 'CDP Disabled means disabled'           (Get-VeeamJobEnabledFlag ([pscustomobject]@{ Name='p'; PolicyState='Disabled' }) $policyDef) 'False'
 Check 'CDP non-disabled means enabled'        (Get-VeeamJobEnabledFlag ([pscustomobject]@{ Name='p'; PolicyState='Running' }) $policyDef) 'True'
+
+# Application backup policies (SAP HANA, Oracle RMAN): ScheduleEnabled stays True when
+# the policy is disabled, so the state must come from Veeam's CBackupJob instead.
+$appDef = Get-VeeamJobFamilyDefinition 'VBRApplication'
+$appPolicy = [pscustomobject]@{ Id = [guid]'11111111-2222-3333-4444-555555555555'; Name = 'Example SAP HANA Policy'; ScheduleEnabled = $true }
+Check 'no Veeam here: CBackupJob cannot be read' "[$(Get-VeeamCoreJobScheduleFlag -Id $appPolicy.Id)]" '[]'
+& {
+    function Get-VeeamCoreJobScheduleFlag { param($Id) $script:CoreFlagFake }
+    $script:CoreFlagFake = $false
+    Check 'application policy: disabled although ScheduleEnabled is True' (Get-VeeamJobEnabledFlag $appPolicy $appDef) 'False'
+    $script:CoreFlagFake = $true
+    Check 'application policy: enabled from CBackupJob' (Get-VeeamJobEnabledFlag $appPolicy $appDef) 'True'
+    $script:CoreFlagFake = $null
+    Check 'application policy: unknown state fails closed' (Throws { Get-VeeamJobEnabledFlag $appPolicy $appDef }) 'True'
+}
+Check 'application policy: never read from ScheduleEnabled' (@($appDef.Enabled) -contains 'ScheduleEnabled') 'False'
+
+# Rollback: a job this run tried to turn off is always switched back on, even when its
+# flag says it is on. An untouched job that is on is left alone.
+& {
+    $script:EnableCalls = 0
+    function Get-VeeamJobByRecord { param($JobRecord) [pscustomobject]@{ Definition = $appDef; Job = $appPolicy } }
+    function Get-VeeamJobEnabledFlag { param($Job, $Definition) $true }
+    function Invoke-VeeamJobTransition { param($Definition, $Job, $Action) if ($Action -eq 'Enable') { $script:EnableCalls++ } }
+    $touchedRecord = [pscustomobject]@{ Family = 'VBRApplication'; Id = 'x'; Name = 'touched'; WasEnabled = $true; DisableAttempted = $true; Disabled = $false; Restored = $false }
+    $untouchedRecord = [pscustomobject]@{ Family = 'VBRApplication'; Id = 'y'; Name = 'untouched'; WasEnabled = $true; DisableAttempted = $false; Disabled = $false; Restored = $false }
+    $oldRecord = [pscustomobject]@{ Family = 'VBRJob'; Id = 'z'; Name = 'old record'; WasEnabled = $true; Disabled = $true; Restored = $false }
+    Check 'rollback: a touched job is switched on even if its flag says on' "$(Enable-VeeamJobById $touchedRecord) $script:EnableCalls" 'True 1'
+    Check 'rollback: an untouched enabled job is left alone' "$(Enable-VeeamJobById $untouchedRecord) $script:EnableCalls" 'False 1'
+    Check 'rollback: a record without DisableAttempted but Disabled is switched on' "$(Enable-VeeamJobById $oldRecord) $script:EnableCalls" 'True 2'
+}
+$disableBody = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Disable-VeeamManagedJobs' }, $true))[0].Extent.Text
+$attemptAt = $disableBody.IndexOf('$record.DisableAttempted = $true')
+Check 'disable: the attempt is saved before the Veeam call' ($attemptAt -gt 0 -and $disableBody.IndexOf('Save-DisabledJobState', $attemptAt) -lt $disableBody.IndexOf('-Action Disable', $attemptAt)) 'True'
+Check 'every re-enable logs what really happened' @([regex]::Matches($scriptText, '(?m)^\s*Enable-VeeamJobById \$')).Count 0
 Check 'configuration backup gets stable ID'  (Get-VeeamJobIdentity ([pscustomobject]@{ Name='Configuration Backup' }) 'VBRConfig') 'VBR-CONFIGURATION-BACKUP'
 Check 'ordinary job without stable ID throws' (Throws { Get-VeeamJobIdentity ([pscustomobject]@{ Name='No ID' }) 'VBRJob' }) 'True'
 

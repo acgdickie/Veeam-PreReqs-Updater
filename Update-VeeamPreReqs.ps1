@@ -2272,10 +2272,10 @@ function Invoke-NatsOnlyUpdate {
     $failedJobs = @()
     foreach ($j in $script:DisabledJobs) {
         try {
-            Enable-VeeamJobById $j
+            $switched = Enable-VeeamJobById $j
             $j.Restored = $true
             Save-DisabledJobState
-            Write-Log "  re-enabled $($j.Family): $($j.Name)"
+            Write-Log $(if ($switched) { "  re-enabled $($j.Family): $($j.Name)" } else { "  $($j.Family): $($j.Name) was never turned off; still enabled" })
         }
         catch { $failedJobs += "$($j.Name) ($($_.Exception.Message))"; Write-Log "  COULD NOT re-enable $($j.Name): $($_.Exception.Message)" ERROR }
     }
@@ -2475,10 +2475,10 @@ function Invoke-Rollback {
     if ($problems.Count -eq 0) {
         foreach ($j in $script:DisabledJobs) {
             try {
-                Enable-VeeamJobById $j
+                $switched = Enable-VeeamJobById $j
                 if ($j.PSObject.Properties.Name -contains 'Restored') { $j.Restored = $true }
                 Save-DisabledJobState
-                Write-Log "  re-enabled $($j.Family): $($j.Name)"
+                Write-Log $(if ($switched) { "  re-enabled $($j.Family): $($j.Name)" } else { "  $($j.Family): $($j.Name) was never turned off; still enabled" })
             } catch { $problems += "job '$($j.Name)': $($_.Exception.Message)" }
         }
     } else {
@@ -3580,7 +3580,8 @@ function Get-VeeamJobFamilyDefinitions {
             [pscustomobject]@{ Family='VBRBackupCopy';  Get='Get-VBRBackupCopyJob';           Disable='Disable-VBRBackupCopyJob';           Enable='Enable-VBRBackupCopyJob';           Argument='Job';             Transition='Command';      Required=$false; Enabled=@('JobEnabled','IsEnabled','IsScheduleEnabled') },
             [pscustomobject]@{ Family='VBRTape';        Get='Get-VBRTapeJob';                 Disable='Disable-VBRJob';                     Enable='Enable-VBRJob';                     Argument='Job';             Transition='Command';      Required=$false; Enabled=@('Enabled','IsScheduleEnabled','IsEnabled') },
             [pscustomobject]@{ Family='VBRSureBackup';  Get='Get-VBRSureBackupJob';           Disable='Disable-VBRSureBackupJob';           Enable='Enable-VBRSureBackupJob';           Argument='Job';             Transition='Command';      Required=$false; Enabled=@('IsEnabled','Enabled','IsScheduleEnabled') },
-            [pscustomobject]@{ Family='VBRApplication'; Get='Get-VBRApplicationBackupJob';    Disable='Disable-VBRApplicationBackupJob';    Enable='Enable-VBRApplicationBackupJob';    Argument='Job';             Transition='Command';      Required=$false; Enabled=@('ScheduleEnabled','IsScheduleEnabled','IsEnabled') },
+            # Enabled is not read from these properties: see Get-VeeamJobEnabledFlag.
+            [pscustomobject]@{ Family='VBRApplication'; Get='Get-VBRApplicationBackupJob';    Disable='Disable-VBRApplicationBackupJob';    Enable='Enable-VBRApplicationBackupJob';    Argument='Job';             Transition='Command';      Required=$false; Enabled=@('CBackupJob.IsScheduleEnabled') },
             [pscustomobject]@{ Family='VBRPlugin';      Get='Get-VBRPluginJob';               Disable='Disable-VBRPluginJob';               Enable='Enable-VBRPluginJob';               Argument='Job';             Transition='Command';      Required=$false; Enabled=@('IsEnabled','Enabled','IsScheduleEnabled') },
             [pscustomobject]@{ Family='VBRStandalone';  Get='Get-VBREPJob';                  Disable='Disable-VBREPJob';                  Enable='Enable-VBREPJob';                  Argument='Job';             Transition='Command';      Required=$false; Enabled=@('IsEnabled','Enabled','IsScheduleEnabled') },
             [pscustomobject]@{ Family='VBRProtection';  Get='Get-VBRProtectionGroup';         Disable='Disable-VBRProtectionGroup';         Enable='Enable-VBRProtectionGroup';         Argument='ProtectionGroup'; Transition='Command';      Required=$false; Enabled=@('Enabled','IsEnabled') },
@@ -3612,8 +3613,33 @@ function Get-VeeamJobFamilyDefinition {
     return $def[0]
 }
 
+# Whether a job is enabled, from Veeam's own CBackupJob (Veeam.Backup.Core). Not a
+# supported API, but Veeam's product management names it as the way to read this for
+# application backup policies. $null when the type or the job cannot be read.
+function Get-VeeamCoreJobScheduleFlag {
+    param([Parameter(Mandatory)] $Id)
+    try {
+        $coreType = 'Veeam.Backup.Core.CBackupJob' -as [type]
+        if (-not $coreType) { return $null }
+        $core = $coreType::Find([guid]"$Id")
+        if ($null -eq $core -or $core.PSObject.Properties.Name -notcontains 'IsScheduleEnabled') { return $null }
+        return [bool]$core.IsScheduleEnabled
+    } catch { return $null }
+}
+
 function Get-VeeamJobEnabledFlag {
     param([Parameter(Mandatory)] $Job, [Parameter(Mandatory)] $Definition)
+    # An application backup policy (SAP HANA, Oracle RMAN, SAP on Oracle) has no enabled
+    # property: its ScheduleEnabled stays True when the policy is disabled. Checked on
+    # VBR 12.3: CBackupJob's IsScheduleEnabled is False after Disable and True after
+    # Enable. Without it the state is unknown, so refuse rather than guess.
+    if ("$($Definition.Family)" -eq 'VBRApplication') {
+        $coreFlag = Get-VeeamCoreJobScheduleFlag -Id $Job.Id
+        if ($null -eq $coreFlag) {
+            throw [System.NotSupportedException]::new("VBRApplication policy '$($Job.Name)': its PowerShell object has no enabled property, and Veeam's CBackupJob could not be read, so whether it is enabled is unknown")
+        }
+        return $coreFlag
+    }
     foreach ($propertyName in @($Definition.Enabled)) {
         if ($Job.PSObject.Properties.Name -contains $propertyName) {
             if ($propertyName -eq 'PolicyState') { return ("$($Job.$propertyName)" -ne 'Disabled') }
@@ -3741,17 +3767,26 @@ function Get-VeeamJobByRecord {
 }
 
 # Re-enable one recorded job and prove its enabled state. Used by normal and
-# pre-installer recovery paths.
+# pre-installer recovery paths. A job this run tried to disable is always switched back
+# on, whatever its flag says: a flag that cannot see the change must never let the
+# rollback skip a job it turned off. Returns $true when it switched the job on, and
+# $false when the job was untouched and already on.
 function Enable-VeeamJobById {
     param([Parameter(Mandatory)] $JobRecord)
     $found = Get-VeeamJobByRecord $JobRecord
-    if (-not (Get-VeeamJobEnabledFlag -Job $found.Job -Definition $found.Definition)) {
+    $recordNames = @($JobRecord.PSObject.Properties.Name)
+    $touched = ($recordNames -contains 'DisableAttempted' -and [bool]$JobRecord.DisableAttempted) -or
+               ($recordNames -contains 'Disabled' -and [bool]$JobRecord.Disabled)
+    $switched = $false
+    if ($touched -or -not (Get-VeeamJobEnabledFlag -Job $found.Job -Definition $found.Definition)) {
         Invoke-VeeamJobTransition -Definition $found.Definition -Job $found.Job -Action Enable
+        $switched = $true
     }
     $verify = Get-VeeamJobByRecord $JobRecord
     if (-not (Get-VeeamJobEnabledFlag -Job $verify.Job -Definition $verify.Definition)) {
         throw "$($JobRecord.Family) '$($JobRecord.Name)' is still disabled after Enable"
     }
+    return $switched
 }
 
 function Save-DisabledJobState {
@@ -3771,6 +3806,7 @@ function Disable-VeeamManagedJobs {
             Id         = $_.Id
             Name       = $_.Name
             WasEnabled = $true
+            DisableAttempted = $false
             Disabled   = $false
             Restored   = $false
         }
@@ -3783,6 +3819,10 @@ function Disable-VeeamManagedJobs {
         if (-not (Get-VeeamJobEnabledFlag -Job $found.Job -Definition $found.Definition)) {
             throw "$($record.Family) '$($record.Name)' changed to disabled before this run could disable it; refusing an ambiguous round trip"
         }
+        # Recorded before the call: from here this run may have turned the job off, so
+        # every way back switches it on again, whatever the next check says.
+        $record.DisableAttempted = $true
+        Save-DisabledJobState
         Invoke-VeeamJobTransition -Definition $found.Definition -Job $found.Job -Action Disable
         $verify = Get-VeeamJobByRecord $record
         if (Get-VeeamJobEnabledFlag -Job $verify.Job -Definition $verify.Definition) {
@@ -5166,10 +5206,10 @@ function Invoke-ExplicitRecovery {
     if ($problems.Count -eq 0) {
         foreach ($job in @($script:DisabledJobs)) {
             try {
-                Enable-VeeamJobById $job
+                $switched = Enable-VeeamJobById $job
                 if ($job.PSObject.Properties.Name -contains 'Restored') { $job.Restored = $true }
                 Save-DisabledJobState
-                Write-Log "  recovery re-enabled $($job.Family): $($job.Name)"
+                Write-Log $(if ($switched) { "  recovery re-enabled $($job.Family): $($job.Name)" } else { "  recovery: $($job.Family): $($job.Name) is already enabled" })
             }
             catch { $problems += "job '$($job.Name)': $($_.Exception.Message)" }
         }
@@ -7601,10 +7641,10 @@ if (-not $idleBeforeEnable.Idle) {
 $failedJobs = @()
 foreach ($j in $script:DisabledJobs) {
     try {
-        Enable-VeeamJobById $j
+        $switched = Enable-VeeamJobById $j
         $j.Restored = $true
         Save-DisabledJobState
-        Write-Log "  re-enabled $($j.Family): $($j.Name)"
+        Write-Log $(if ($switched) { "  re-enabled $($j.Family): $($j.Name)" } else { "  $($j.Family): $($j.Name) was never turned off; still enabled" })
     }
     catch { $failedJobs += "$($j.Name) ($($_.Exception.Message))"; Write-Log "  COULD NOT re-enable $($j.Name): $($_.Exception.Message)" ERROR }
 }
