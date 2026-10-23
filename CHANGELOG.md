@@ -14,6 +14,12 @@ you change a script, add your entry at the top.
   without loss, to pages in [`docs/`](docs/README.md), and this changelog moved from the
   README to `CHANGELOG.md`.
 
+### Fixed
+
+* [NATS updates (VB365)](docs/nats.md) said the NATS update was built from Veeam's
+  documentation, not from a live install. It has run on a live VB365 server, and the page
+  now says so.
+
 ## 2026-10-22
 
 ### Fixed

@@ -23,7 +23,7 @@ VBR does not use NATS, so on VBR `NatsStatus=NOT_APPLICABLE`.
 > [!IMPORTANT]
 > Before the first NATS update, run the audit on the VB365 servers and read `NatsStatus` and `NatsDetail`.
 
-The script was built from Veeam's documentation, not from a live VB365 NATS install. An `UNRECOGNISED_LAYOUT` result names the part that differs.
+The NATS update has been tested on a live VB365 server: NATS 2.10.22 went to 2.10.28, and VB365 worked on the new version. Other servers can be set up differently, so audit first. An `UNRECOGNISED_LAYOUT` result names the part that differs.
 
 ## Version policy
 
