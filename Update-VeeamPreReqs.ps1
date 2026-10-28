@@ -3748,8 +3748,15 @@ function Invoke-VeeamJobTransition {
         if ($typeName -match 'ObjectStorage') { $commandName = 'Set-VBRObjectStorageBackupJob' }
         elseif ($typeName -match 'NAS|File')  { $commandName = 'Set-VBRNASBackupJob' }
         else { throw [System.NotSupportedException]::new("Unknown unstructured job subtype '$typeName' for '$($Job.Name)'") }
-        $invokeArgs = @{ Job=$Job; EnableSchedule=$enableValue; ErrorAction='Stop' }
+        # These Set- commands check the whole job again. A job warning, such as "Potential
+        # data sovereignty violation" when source and target location tags differ, stops
+        # them unless -Force is given. The caller still verifies the new schedule state.
+        $invokeArgs = @{ Job=$Job; EnableSchedule=$enableValue; ErrorAction='Stop'; WarningAction='SilentlyContinue'; WarningVariable='veeamWarnings' }
+        if ((Get-Command $commandName -ErrorAction Stop).Parameters.ContainsKey('Force')) { $invokeArgs['Force'] = $true }
         & $commandName @invokeArgs | Out-Null
+        foreach ($warning in $veeamWarnings) {
+            Write-Log "  Veeam warned about $($Definition.Family) '$($Job.Name)': $(Format-ShortText "$warning" 200)"
+        }
         return
     }
     $commandName = if ($Action -eq 'Disable') { $Definition.Disable } else { $Definition.Enable }

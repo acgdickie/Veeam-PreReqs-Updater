@@ -614,6 +614,37 @@ Check 'application policy: never read from ScheduleEnabled' (@($appDef.Enabled) 
     Check 'rollback: an untouched enabled job is left alone' "$(Enable-VeeamJobById $untouchedRecord) $script:EnableCalls" 'False 1'
     Check 'rollback: a record without DisableAttempted but Disabled is switched on' "$(Enable-VeeamJobById $oldRecord) $script:EnableCalls" 'True 2'
 }
+# Unstructured jobs (file share, object storage): the Set- commands check the whole job
+# again, and a location-tag warning ("Potential data sovereignty violation") stops them
+# unless -Force is given. Seen on a real VBR 12.3 server with Azure targets.
+if (-not ('VeeamPgTestNASBackupJob' -as [type])) {
+    Add-Type -TypeDefinition 'public class VeeamPgTestNASBackupJob { public string Name = "Example File Share Job"; } public class VeeamPgTestObjectStorageBackupJob { public string Name = "Example Blob Job"; }'
+}
+& {
+    $script:SetCalls = @()
+    $script:Logged = @()
+    function Write-Log { param($Message, $Level) $script:Logged += "$Message" }
+    function Set-VBRNASBackupJob {
+        [CmdletBinding()] param($Job, [switch] $EnableSchedule, [switch] $Force)
+        if (-not $Force) { throw 'Potential data sovereignty violation: original and target computer locations do not match.' }
+        Write-Warning "Potential data sovereignty violation: original and target computer locations do not match.`nOriginal location: No location tag"
+        $script:SetCalls += "NAS $([bool]$EnableSchedule)"
+    }
+    function Set-VBRObjectStorageBackupJob {
+        [CmdletBinding()] param($Job, [switch] $EnableSchedule, [switch] $Force)
+        if (-not $Force) { throw 'Potential data sovereignty violation' }
+        $script:SetCalls += "ObjectStorage $([bool]$EnableSchedule)"
+    }
+    $unstructuredDef = Get-VeeamJobFamilyDefinition 'VBRUnstructured'
+    $nasJob = New-Object VeeamPgTestNASBackupJob
+    $blobJob = New-Object VeeamPgTestObjectStorageBackupJob
+    Check 'unstructured: file share off passes the location warning' (Throws { Invoke-VeeamJobTransition -Definition $unstructuredDef -Job $nasJob -Action Disable }) 'False'
+    Check 'unstructured: file share on passes it too' (Throws { Invoke-VeeamJobTransition -Definition $unstructuredDef -Job $nasJob -Action Enable }) 'False'
+    Check 'unstructured: object storage off and on pass it' (Throws { Invoke-VeeamJobTransition -Definition $unstructuredDef -Job $blobJob -Action Disable; Invoke-VeeamJobTransition -Definition $unstructuredDef -Job $blobJob -Action Enable }) 'False'
+    Check 'unstructured: the right command and state each time' ($script:SetCalls -join ', ') 'NAS False, NAS True, ObjectStorage False, ObjectStorage True'
+    Check 'unstructured: the warning is logged on one line' (@($script:Logged | Where-Object { $_ -like "*VBRUnstructured 'Example File Share Job': Potential data sovereignty violation*Original location: No location tag" }).Count) 2
+    Check 'unstructured: no warning, nothing logged' (@($script:Logged | Where-Object { $_ -like '*Example Blob Job*' }).Count) 0
+}
 $disableBody = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Disable-VeeamManagedJobs' }, $true))[0].Extent.Text
 $attemptAt = $disableBody.IndexOf('$record.DisableAttempted = $true')
 Check 'disable: the attempt is saved before the Veeam call' ($attemptAt -gt 0 -and $disableBody.IndexOf('Save-DisabledJobState', $attemptAt) -lt $disableBody.IndexOf('-Action Disable', $attemptAt)) 'True'

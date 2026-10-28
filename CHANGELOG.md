@@ -5,6 +5,19 @@ All notable changes, newest first. The format follows
 numbers, so each entry is the date the change reached GitHub, with its commit IDs. When
 you change a script, add your entry at the top.
 
+## 2026-10-28
+
+### Fixed
+
+* File share and object storage backup jobs (`Get-VBRUnstructuredBackupJob`) could not be
+  turned off when Veeam warns about the job. To change the schedule, the script uses
+  `Set-VBRNASBackupJob` or `Set-VBRObjectStorageBackupJob`, and these commands check the
+  whole job again. On a VBR 12.3 server with Azure targets, the warning "Potential data
+  sovereignty violation" (source and target location tags differ) stopped the command. The
+  run stopped with `JOB_DISABLE_FAILED` and rolled back. The script now passes `-Force`
+  when the command has it, and writes Veeam's warning to the log on one line. It still
+  checks that each job really turned off, and back on.
+
 ## 2026-10-23
 
 ### Changed
