@@ -41,7 +41,7 @@ $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
         'Resolve-PgInstallerLinkFromHtml',
         'Get-VeeamJobFamilyDefinitions','Get-VeeamJobFamilyDefinition',
         'Get-VeeamCoreJob','Get-VeeamCoreJobScheduleFlag','Get-VeeamJobEnabledFlag','Get-VeeamJobScheduleFingerprint','Get-VeeamJobIdentity','Get-VeeamManagedJobInventory',
-        'Invoke-VeeamJobTransition','Get-VeeamJobByRecord','Enable-VeeamJobById','Disable-VeeamManagedJobs',
+        'Invoke-VeeamJobTransition','Get-VeeamJobByRecord','Enable-VeeamJobById','Disable-VeeamManagedJobs','Test-VeeamJobKeptOn',
         'Get-ActiveLabelsFromSessions','Get-ActiveVb365OrganizationSyncWork','Get-Vb365QueuedSyncTiming','Write-Vb365StuckSyncOnce','Test-VbrFamilyInUse','Get-BlockingVeeamUiProcesses',
         'Get-ActiveVeeamWork','Wait-VeeamIdle','Find-Vb365MaintenanceBarrier','Start-Vb365MaintenanceBarrier',
         'Get-UnrestoredJobNames',
@@ -685,6 +685,29 @@ Check 'schedule text: no schedule fields fails closed' (Throws { Get-VeeamJobSch
     [void](Enable-VeeamJobById $script:DisabledJobs[0])
     Check 'enable: a changed schedule is a warning' (@($script:Logged | Where-Object { $_ -like "*VBRUnstructured 'Example Blob Job' is on again, but its schedule is not the same as before this run*" }).Count) 1
 }
+# The configuration backup job is never turned off: the operator's choice.
+Check 'kept on: the configuration backup job' (Test-VeeamJobKeptOn 'VBRConfig') 'True'
+Check 'kept on: other jobs are turned off'    (Test-VeeamJobKeptOn 'VBRJob') 'False'
+& {
+    $script:Logged = @(); $script:Transitions = @(); $script:KeptState = @{}
+    function Write-Log { param($Message, $Level) $script:Logged += "$Message" }
+    function Save-DisabledJobState {}
+    function Save-RecoveryState { param($Stage, $InstallerStarted) }
+    function Get-VeeamJobByRecord { param($JobRecord) [pscustomobject]@{ Definition = (Get-VeeamJobFamilyDefinition "$($JobRecord.Family)"); Job = [pscustomobject]@{ Name = "$($JobRecord.Name)" } } }
+    function Get-VeeamJobEnabledFlag { param($Job, $Definition) -not $script:KeptState.ContainsKey("$($Job.Name)") }
+    function Invoke-VeeamJobTransition { param($Definition, $Job, $Action)
+        $script:Transitions += "$Action $($Definition.Family)"
+        if ($Action -eq 'Disable') { $script:KeptState["$($Job.Name)"] = $true } }
+    $keptInventory = @(
+        [pscustomobject]@{ Family = 'VBRConfig'; Id = 'VBR-CONFIGURATION-BACKUP'; Name = 'Backup Configuration Job'; Enabled = $true; Object = $null },
+        [pscustomobject]@{ Family = 'VBRJob'; Id = 'job-1'; Name = 'Example Backup Job'; Enabled = $true; Object = $null })
+    Disable-VeeamManagedJobs -Inventory $keptInventory
+    Check 'kept on: only the other job is turned off' ($script:Transitions -join ', ') 'Disable VBRJob'
+    Check 'kept on: it is not in the record'          (@($script:DisabledJobs | ForEach-Object { $_.Family }) -join ',') 'VBRJob'
+    Check 'kept on: the log says it stays on'         (@($script:Logged | Where-Object { $_ -like '*left on: VBRConfig: Backup Configuration Job*' }).Count) 1
+}
+Check 'kept on: every enabled-job check skips it' ([regex]::Matches($scriptText, [regex]::Escape('Where-Object { $_.Enabled })')).Count) 0
+Check 'kept on: a recovery can still switch it on' (Get-VeeamJobFamilyDefinition 'VBRConfig').Family 'VBRConfig'
 Check 'install: open consoles are closed at the start' ($scriptText.IndexOf('at the start of this -Install run') -gt 0 -and $scriptText.IndexOf('at the start of this -Install run') -lt $scriptText.IndexOf("Write-Log 'STEP 4 - Confirm database engine'")) 'True'
 $disableBody = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Disable-VeeamManagedJobs' }, $true))[0].Extent.Text
 $attemptAt = $disableBody.IndexOf('$record.DisableAttempted = $true')

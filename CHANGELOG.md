@@ -22,6 +22,9 @@ you change a script, add your entry at the top.
 
 ### Changed
 
+* The configuration backup job is no longer turned off. The Veeam services are stopped
+  while PostgreSQL is updated, so it cannot run then, and the run makes its own
+  configuration backup in STEP 14. A recovery of an older run still switches it back on.
 * An `-Install` run closes every open Veeam console at the start (STEP 3), by force if it
   must. Before, it closed a console only when the console was the only thing left
   blocking. That rule still applies to a console opened later in the run. An audit still

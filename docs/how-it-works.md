@@ -135,6 +135,10 @@ the RMM summary. See [Exit codes](exit-codes.md) and [If it goes wrong](troubles
 
 #### STEP 13 detail
 
+The configuration backup job is never turned off. The Veeam services are stopped while
+PostgreSQL is updated, so it cannot run then, and the run makes its own configuration
+backup in STEP 14. The log says "left on" for it.
+
 File share and object storage backup jobs are turned off with the console's Disable
 (`Disable-VBRJob`), so each job keeps its schedule. The script reads the schedule before
 and after. If turning a job off changes its schedule, the run stops and rolls back. If the

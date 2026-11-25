@@ -1879,7 +1879,7 @@ function Invoke-NatsOnlyUpdate {
         $script:ManagedJobInventory = @(Get-VeeamManagedJobInventory -Vbr $hasVbr -Vb365 $hasVb365)
         Disable-VeeamManagedJobs -Inventory $script:ManagedJobInventory
         $inventoryAfterDisable = @(Get-VeeamManagedJobInventory -Vbr $hasVbr -Vb365 $hasVb365)
-        $unexpectedEnabled = @($inventoryAfterDisable | Where-Object { $_.Enabled })
+        $unexpectedEnabled = @($inventoryAfterDisable | Where-Object { $_.Enabled -and -not (Test-VeeamJobKeptOn "$($_.Family)") })
         if ($unexpectedEnabled.Count -gt 0) {
             throw "schedule inventory changed during disable; still enabled: $((@($unexpectedEnabled) | ForEach-Object { "$($_.Family):$($_.Name)" }) -join ', ')"
         }
@@ -1955,7 +1955,7 @@ function Invoke-NatsOnlyUpdate {
 
     try { $finalScheduleInventory = @(Get-VeeamManagedJobInventory -Vbr $hasVbr -Vb365 $hasVb365) }
     catch { Complete-Run $EXIT.PREFLIGHT 'FINAL_JOB_INVENTORY_FAILED' "Could not refresh every schedule immediately before the outage: $($_.Exception.Message)" }
-    $enabledBeforeOutage = @($finalScheduleInventory | Where-Object { $_.Enabled })
+    $enabledBeforeOutage = @($finalScheduleInventory | Where-Object { $_.Enabled -and -not (Test-VeeamJobKeptOn "$($_.Family)") })
     if ($enabledBeforeOutage.Count -gt 0) {
         Complete-Run $EXIT.RETRY 'SCHEDULE_STATE_CHANGED' "Schedules were created or re-enabled before the outage ($((@($enabledBeforeOutage) | ForEach-Object { "$($_.Family):$($_.Name)" }) -join ', ')). The captured schedules will be restored; retry in a controlled window."
     }
@@ -1977,7 +1977,7 @@ function Invoke-NatsOnlyUpdate {
     }
     try { $lastChanceInventory = @(Get-VeeamManagedJobInventory -Vbr $hasVbr -Vb365 $hasVb365) }
     catch { Complete-Run $EXIT.PREFLIGHT 'LAST_CHANCE_JOB_INVENTORY_FAILED' "Could not refresh every schedule before the first service stop: $($_.Exception.Message)" }
-    $lastChanceEnabled = @($lastChanceInventory | Where-Object { $_.Enabled })
+    $lastChanceEnabled = @($lastChanceInventory | Where-Object { $_.Enabled -and -not (Test-VeeamJobKeptOn "$($_.Family)") })
     if ($lastChanceEnabled.Count -gt 0) {
         Complete-Run $EXIT.RETRY 'LAST_CHANCE_SCHEDULE_STATE_CHANGED' "Schedules were created or re-enabled before the first service stop ($(@($lastChanceEnabled | ForEach-Object { "$($_.Family):$($_.Name)" }) -join ', ')). No service was stopped; captured schedules will be restored."
     }
@@ -3609,6 +3609,15 @@ function Get-VeeamJobFamilyDefinitions {
     return $defs
 }
 
+# Job families this script never turns off. The configuration backup job stays on, by
+# the operator's choice: the Veeam services are stopped while PostgreSQL is updated, so
+# it cannot run then, and the run makes its own configuration backup in STEP 14. Its
+# definition stays, so a recovery can still switch it on after an older run.
+function Test-VeeamJobKeptOn {
+    param([AllowEmptyString()][string] $Family)
+    return ($Family -in @('VBRConfig'))
+}
+
 function Get-VeeamJobFamilyDefinition {
     param([Parameter(Mandatory)][string] $Family)
     $def = @(Get-VeeamJobFamilyDefinitions -Vbr $true -Vb365 $true | Where-Object { $_.Family -eq $Family })
@@ -3847,10 +3856,13 @@ function Save-DisabledJobState {
 function Disable-VeeamManagedJobs {
     param([Parameter(Mandatory)][AllowEmptyCollection()][object[]] $Inventory)
 
+    foreach ($keptOn in @($Inventory | Where-Object { $_.Enabled -and (Test-VeeamJobKeptOn "$($_.Family)") })) {
+        Write-Log "  left on: $($keptOn.Family): $($keptOn.Name) (this script never turns it off)"
+    }
     # Persist the complete intent before the first mutation. If the process dies
     # between a Veeam call and the following state write, recovery can safely
     # re-enable every object that was known to be enabled on entry.
-    $script:DisabledJobs = @($Inventory | Where-Object { $_.Enabled } | ForEach-Object {
+    $script:DisabledJobs = @($Inventory | Where-Object { $_.Enabled -and -not (Test-VeeamJobKeptOn "$($_.Family)") } | ForEach-Object {
         [pscustomobject][ordered]@{
             Family     = $_.Family
             Id         = $_.Id
@@ -6837,7 +6849,7 @@ try {
     $script:ManagedJobInventory = @(Get-VeeamManagedJobInventory -Vbr $hasVbr -Vb365 $hasVb365)
     Disable-VeeamManagedJobs -Inventory $script:ManagedJobInventory
     $inventoryAfterDisable = @(Get-VeeamManagedJobInventory -Vbr $hasVbr -Vb365 $hasVb365)
-    $unexpectedEnabled = @($inventoryAfterDisable | Where-Object { $_.Enabled })
+    $unexpectedEnabled = @($inventoryAfterDisable | Where-Object { $_.Enabled -and -not (Test-VeeamJobKeptOn "$($_.Family)") })
     if ($unexpectedEnabled.Count -gt 0) {
         throw "schedule inventory changed during disable; still enabled: $((@($unexpectedEnabled) | ForEach-Object { "$($_.Family):$($_.Name)" }) -join ', ')"
     }
@@ -7092,7 +7104,7 @@ try { $finalScheduleInventory = @(Get-VeeamManagedJobInventory -Vbr $hasVbr -Vb3
 catch {
     Complete-Run $EXIT.PREFLIGHT 'FINAL_JOB_INVENTORY_FAILED' "Could not refresh every schedule immediately before the outage: $($_.Exception.Message)"
 }
-$enabledBeforeOutage = @($finalScheduleInventory | Where-Object { $_.Enabled })
+$enabledBeforeOutage = @($finalScheduleInventory | Where-Object { $_.Enabled -and -not (Test-VeeamJobKeptOn "$($_.Family)") })
 if ($enabledBeforeOutage.Count -gt 0) {
     $enabledNames = (@($enabledBeforeOutage) | ForEach-Object { "$($_.Family):$($_.Name)" }) -join ', '
     Complete-Run $EXIT.RETRY 'SCHEDULE_STATE_CHANGED' "Schedules were created or re-enabled during the protected backup phase ($enabledNames). The captured schedules will be restored; retry in a controlled window."
@@ -7151,7 +7163,7 @@ catch {
     $lastInventoryIssue = if ($lastInventoryCode -eq $EXIT.UNSUPPORTED) { 'UNSUPPORTED_SCHEDULER_FAMILY' } else { 'LAST_CHANCE_JOB_INVENTORY_FAILED' }
     Complete-Run $lastInventoryCode $lastInventoryIssue "Could not refresh every schedule after the final drain: $($_.Exception.Message)"
 }
-$lastChanceEnabled = @($lastChanceInventory | Where-Object { $_.Enabled })
+$lastChanceEnabled = @($lastChanceInventory | Where-Object { $_.Enabled -and -not (Test-VeeamJobKeptOn "$($_.Family)") })
 if ($lastChanceEnabled.Count -gt 0) {
     $enabledNames = @($lastChanceEnabled | ForEach-Object { "$($_.Family):$($_.Name)" }) -join ', '
     Complete-Run $EXIT.RETRY 'LAST_CHANCE_SCHEDULE_STATE_CHANGED' "Schedules were created or re-enabled during the final drain ($enabledNames). No service was stopped; captured schedules will be restored and the run must be retried under a change freeze."
