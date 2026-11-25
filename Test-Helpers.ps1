@@ -49,7 +49,7 @@ $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
         'Invoke-ExplicitRecovery',
         'Get-ServiceStartupTypeExact','Set-ServiceStartupTypeExact','Test-PgServiceExecutableMatchesBaseDir','Test-PathTreeOverlap',
         'Get-VeeamServiceState','Disable-VeeamServiceStartup','Restore-VeeamServiceState',
-        'Add-ReportListItem','Get-VeeamConsoleProcesses','Close-VeeamConsoleProcesses','Test-OnlyConsoleBlockers',
+        'Add-ReportListItem','Get-VeeamConsoleProcesses','Close-VeeamConsoleProcesses','Test-OnlyConsoleBlockers','Format-PgClientSummary','Get-VeeamPgClientProgramNames','Resolve-VeeamPgClientProcess','Stop-VeeamPgClientProcess',
         'Start-StoppedAutomaticVeeamServices','Invoke-VbrConfigBackupAttempt','Invoke-RecoveryPgTuning',
         'Add-RunSideEffectNotes',
         'Get-NatsPolicy','Get-Vb365ReleaseKey','Resolve-NatsTarget','ConvertFrom-NatsImagePath','ConvertFrom-NatsVersionText',
@@ -124,8 +124,9 @@ $commandParameters = @($ast.FindAll({
     $node -is [System.Management.Automation.Language.CommandParameterAst]
 }, $true) | ForEach-Object { $_.ParameterName })
 Check 'never requests ForceStopSessions' (@($commandParameters | Where-Object { $_ -eq 'ForceStopSessions' }).Count) 0
-# Stop-Process is allowed in exactly one place: closing an open Veeam console,
-# which is a client only. Nothing else, and never an Explorer, is ever killed.
+# Stop-Process is allowed in exactly two places: closing an open Veeam console, which
+# is a client only, and closing a leftover Veeam program that stays connected to
+# PostgreSQL after every Veeam service stopped. Nothing else, and never an Explorer.
 $stopProcessCalls = @($ast.FindAll({
     param($node)
     $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Stop-Process'
@@ -135,8 +136,8 @@ $stopProcessOwners = @($stopProcessCalls | ForEach-Object {
     while ($parent -and -not ($parent -is [System.Management.Automation.Language.FunctionDefinitionAst])) { $parent = $parent.Parent }
     if ($parent) { $parent.Name } else { '<script body>' }
 })
-Check 'Stop-Process appears exactly once'        $stopProcessCalls.Count 1
-Check 'Stop-Process only closes Veeam consoles'  (@($stopProcessOwners | Where-Object { $_ -ne 'Close-VeeamConsoleProcesses' }).Count) 0
+Check 'Stop-Process appears exactly twice'       $stopProcessCalls.Count 2
+Check 'Stop-Process only closes Veeam consoles and leftover programs' (@($stopProcessOwners | Where-Object { $_ -notin @('Close-VeeamConsoleProcesses','Stop-VeeamPgClientProcess') }).Count) 0
 $forcedServiceStops = @($ast.FindAll({
     param($node)
     $node -is [System.Management.Automation.Language.CommandAst] -and
@@ -2189,6 +2190,60 @@ Check 'last-chance read closes only a lone console' ($scriptText -match "(?s)\`$
 Check 'final gate says Explorers are never closed' ($scriptText -match 'Explorers are never closed automatically, because one can be running a restore') 'True'
 Check 'report has a ConsolesClosed field'        ($scriptText -match "(?m)^\s+ConsolesClosed = ''") 'True'
 
+'--- Leftover Veeam programs still connected to PostgreSQL after the services stop ---'
+Check 'leftover programs: only the job manager and satellite' ((Get-VeeamPgClientProgramNames) -join ',') 'Veeam.Backup.Manager,Veeam.Backup.Satellite'
+Check 'client summary names each session' (Format-PgClientSummary @([pscustomobject]@{ pid = 1; user = 'postgres'; database = 'VeeamBackup'; application = 'x'; client = '127.0.0.1/32'; state = 'idle' })) 'pid=1,user=postgres,db=VeeamBackup,app=x,client=127.0.0.1/32,state=idle'
+& {
+    $script:FakeProcs = @{ 19436 = 'Veeam.Backup.Manager'; 23832 = 'Veeam.Backup.Satellite'; 500 = 'pgAdmin4' }
+    $script:FakeSignature = 'Valid'
+    $script:FakeSubject = 'CN=Veeam Software Group GmbH, O=Veeam Software Group GmbH'
+    function Get-Process { param([int] $Id, $ErrorAction)
+        if ($script:FakeProcs.ContainsKey($Id)) { [pscustomobject]@{ Id = $Id; ProcessName = $script:FakeProcs[$Id]; Path = "C:\Program Files\Veeam\Backup and Replication\Backup\$($script:FakeProcs[$Id]).exe" } } }
+    function Get-AuthenticodeSignature { param($FilePath, $ErrorAction)
+        [pscustomobject]@{ Status = $script:FakeSignature; SignerCertificate = [pscustomobject]@{ Subject = $script:FakeSubject } } }
+    function New-PgClient { param([string] $App, [string] $State = 'idle', [string] $Address = '127.0.0.1/32')
+        [pscustomobject]@{ pid = 9; user = 'postgres'; database = 'VeeamBackup'; application = $App; client = $Address; state = $State } }
+    Check 'leftover: an idle job manager can be closed' "$((Resolve-VeeamPgClientProcess -Client (New-PgClient 'Veeam.Backup.Manager.exe(12.3.2.4934):19436')).Id)" '19436'
+    Check 'leftover: an idle satellite can be closed'   "$((Resolve-VeeamPgClientProcess -Client (New-PgClient 'Veeam.Backup.Satellite.exe(12.3.2.4934):23832')).Id)" '23832'
+    Check 'leftover: a busy session is never closed'    "$(Resolve-VeeamPgClientProcess -Client (New-PgClient 'Veeam.Backup.Manager.exe(12.3.2.4934):19436' -State 'active'))" ''
+    Check 'leftover: a session from another host is never closed' "$(Resolve-VeeamPgClientProcess -Client (New-PgClient 'Veeam.Backup.Manager.exe(12.3.2.4934):19436' -Address '10.0.0.5/32'))" ''
+    Check 'leftover: another program is never closed'   "$(Resolve-VeeamPgClientProcess -Client (New-PgClient 'pgAdmin4.exe(8.0):500'))" ''
+    Check 'leftover: a reused PID is never closed'      "$(Resolve-VeeamPgClientProcess -Client (New-PgClient 'Veeam.Backup.Manager.exe(12.3.2.4934):500'))" ''
+    Check 'leftover: a PID that is gone is never closed' "$(Resolve-VeeamPgClientProcess -Client (New-PgClient 'Veeam.Backup.Manager.exe(12.3.2.4934):777'))" ''
+    Check 'leftover: no PID in the name, never closed'  "$(Resolve-VeeamPgClientProcess -Client (New-PgClient 'Veeam.Backup.Manager.exe'))" ''
+    $script:FakeSignature = 'NotSigned'
+    Check 'leftover: an unsigned file is never closed'  "$(Resolve-VeeamPgClientProcess -Client (New-PgClient 'Veeam.Backup.Manager.exe(12.3.2.4934):19436'))" ''
+    $script:FakeSignature = 'Valid'; $script:FakeSubject = 'CN=Someone Else'
+    Check 'leftover: a file signed by someone else is never closed' "$(Resolve-VeeamPgClientProcess -Client (New-PgClient 'Veeam.Backup.Manager.exe(12.3.2.4934):19436'))" ''
+}
+& {
+    $script:Report = [ordered]@{ ProcessesClosed = '' }
+    $script:Logged = @(); $script:Killed = @()
+    $script:Alive = @{ 19436 = 'Veeam.Backup.Manager' }
+    function Write-Log { param($Message, $Level) $script:Logged += "$Message" }
+    function Start-Sleep { param($Seconds) }
+    function Get-Process { param([int] $Id, $ErrorAction) if ($script:Alive.ContainsKey($Id)) { [pscustomobject]@{ Id = $Id; ProcessName = $script:Alive[$Id] } } }
+    function Stop-Process { param([int] $Id, [switch] $Force, $ErrorAction) $script:Killed += $Id; if (-not $script:Stubborn) { $script:Alive.Remove($Id) } }
+    $script:Stubborn = $false
+    $manager = [pscustomobject]@{ Id = 19436; ProcessName = 'Veeam.Backup.Manager' }
+    Check 'force close: the program is closed'        (Stop-VeeamPgClientProcess -Process $manager) 'True'
+    Check 'force close: it is named in the report'    $script:Report.ProcessesClosed 'Veeam.Backup.Manager:PID19436'
+    Check 'force close: the log says why'             (@($script:Logged | Where-Object { $_ -like '*Closed the Veeam program Veeam.Backup.Manager PID 19436 by force*idle session*' }).Count) 1
+    $script:Killed = @()
+    Check 'force close: a program already gone is not touched' "$(Stop-VeeamPgClientProcess -Process $manager) $($script:Killed.Count)" 'True 0'
+    $script:Alive[19436] = 'Veeam.Backup.Manager'; $script:Stubborn = $true; $script:Report.ProcessesClosed = ''
+    Check 'force close: a program that will not close is a failure' (Stop-VeeamPgClientProcess -Process $manager) 'False'
+    Check 'force close: a failure is not reported as closed' $script:Report.ProcessesClosed ''
+}
+Check 'report has a ProcessesClosed field'       ($scriptText -match "(?m)^\s+ProcessesClosed = ''") 'True'
+$pgWaitAt = $scriptText.IndexOf('$pgClientWaitSeconds = 300')
+Check 'STEP 15 waits before it closes anything'  ($pgWaitAt -gt 0 -and $pgWaitAt -lt $scriptText.IndexOf('[void](Stop-VeeamPgClientProcess -Process $veeamProcess)')) 'True'
+Check 'STEP 15 closes nothing when another client remains' ($scriptText -match '(?s)if \(\$otherClients\.Count -gt 0 -or \$veeamRunningAgain\.Count -gt 0\) \{.*?PG_CLIENTS_STILL_CONNECTED.*?\}\s+foreach \(\$veeamProcess in') 'True'
+& {
+    function Get-Service { param($Name, $ErrorAction) }
+    $n = Add-RunSideEffectNotes -StateNote 'Scheduled jobs were re-enabled.' -Report ([ordered]@{ ServicesStarted = ''; ConsolesClosed = ''; ProcessesClosed = 'Veeam.Backup.Manager:PID19436'; StaleEmRecord = '' })
+    Check 'a closed program reaches the summary note' ($n -like '*closed the Veeam program(s) Veeam.Backup.Manager:PID19436 by force*') 'True'
+}
 '--- Licence-restricted job families are empty, not unreadable ---'
 # Below Enterprise Plus, Get-VBRApplicationBackupJob throws because the feature
 # needs Enterprise Plus. A feature the licence excludes cannot have jobs running.
@@ -2353,7 +2408,7 @@ $odd = @(ConvertFrom-JsonArrayText '["Veeam Backup","a,b","cache_12345678-1234-1
 Check 'name with a space survives'   $odd[0] 'Veeam Backup'
 Check 'name with a comma survives'   $odd[1] 'a,b'
 Check 'every psql list uses helper'  ($scriptText -match '\$databaseListRes\.StdOut \| ConvertFrom-Json') 'False'
-Check 'client list uses helper'      ($scriptText -match 'ConvertFrom-JsonArrayText \$clientActivityResult\.StdOut') 'True'
+Check 'client list uses helper'      ($scriptText -match 'return @\(ConvertFrom-JsonArrayText \$result\.StdOut\)') 'True'
 Check 'final list uses helper'       ($scriptText -match 'ConvertFrom-JsonArrayText \$finalListRes\.StdOut') 'True'
 
 '--- Resolve-VeeamDatabaseNames (database name case mismatch) ---'

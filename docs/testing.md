@@ -103,7 +103,8 @@ It also tests the configuration backup check in `Clear-StaleEnterpriseManagerRec
 It also checks rules that must always hold, by reading the script itself. For example:
 
 * **Services**: the script never force-stops a service.
-* **`Stop-Process`**: the script uses it only to close a Veeam console.
+* **`Stop-Process`**: the script uses it only to close a Veeam console, or a leftover
+  Veeam program that stays connected to PostgreSQL after every Veeam service stopped.
 * **Audit run**: an audit run never closes a console.
 * **Configuration backup**: it is never retried more than once.
 

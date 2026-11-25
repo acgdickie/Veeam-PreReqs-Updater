@@ -22,6 +22,14 @@ you change a script, add your entry at the top.
 
 ### Changed
 
+* A Veeam program that stays connected to PostgreSQL after every Veeam service has
+  stopped no longer stops the run straight away (`PG_CLIENTS_STILL_CONNECTED`, exit
+  `10`). Seen on a real VBR 12.3 server: `Veeam.Backup.Manager.exe` and
+  `Veeam.Backup.Satellite.exe` kept idle sessions open. The run now waits up to 5
+  minutes for the sessions to close. Then it closes those two programs by force, only
+  when every remaining session is theirs, idle and local, the file is signed by Veeam,
+  and every Veeam service is still stopped. Any other client still stops the run, as
+  before. New report field `ProcessesClosed`.
 * The configuration backup job is no longer turned off. The Veeam services are stopped
   while PostgreSQL is updated, so it cannot run then, and the run makes its own
   configuration backup in STEP 14. A recovery of an older run still switches it back on.

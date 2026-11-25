@@ -306,6 +306,7 @@ $script:Report       = [ordered]@{
     UnhealthyServices = ''
     ServicesStarted = ''
     ConsolesClosed = ''
+    ProcessesClosed = ''
     Vb365SyncStuck = ''
     RecoveryRunDir = ''
     Detail         = ''
@@ -2802,6 +2803,9 @@ function Add-RunSideEffectNotes {
     }
     $closedList = "$($Report['ConsolesClosed'])"
     if ($closedList) { $notes += "This run closed the open Veeam console(s) $closedList; anything unsaved in them was lost." }
+    if ($Report.Contains('ProcessesClosed') -and "$($Report['ProcessesClosed'])") {
+        $notes += "This run closed the Veeam program(s) $($Report['ProcessesClosed']) by force, because they stayed connected to PostgreSQL after every Veeam service had stopped."
+    }
     if ("$($Report['StaleEmRecord'])" -like 'removed*') {
         $notes += 'This run removed the leftover Enterprise Manager registry key; StaleEmRecord names its .reg backup.'
     }
@@ -4350,6 +4354,67 @@ function Get-VeeamConsoleProcesses {
         ($Vbr -and $_.ProcessName -eq 'Veeam.Backup.Shell') -or
         ($Vb365 -and $_.ProcessName -eq 'Veeam.Archiver.Shell')
     })
+}
+
+# One PostgreSQL client session as text, for the log and the RMM line.
+function Format-PgClientSummary {
+    param([AllowEmptyCollection()][object[]] $Clients)
+    return (@($Clients | ForEach-Object {
+        "pid=$($_.pid),user=$($_.user),db=$($_.database),app=$($_.application),client=$($_.client),state=$($_.state)"
+    }) -join ' | ')
+}
+
+# Veeam programs that the Veeam services start, and that may be closed by force when
+# they stay connected to PostgreSQL after every Veeam service has stopped. They are
+# not services, so stopping the services does not always close them: seen on a real
+# VBR 12.3 server, with idle sessions. Nothing else is ever closed this way.
+function Get-VeeamPgClientProgramNames { @('Veeam.Backup.Manager','Veeam.Backup.Satellite') }
+
+# The local Veeam program that holds one PostgreSQL session, or $null when it may not
+# be closed. Veeam names each session after its program, version and process ID, for
+# example "Veeam.Backup.Manager.exe(12.3.2.4934):19436". The session must be idle and
+# from this server, the program must be one of Get-VeeamPgClientProgramNames, and a
+# live process with that ID and name must run from a file Veeam has signed.
+function Resolve-VeeamPgClientProcess {
+    param([Parameter(Mandatory)] $Client)
+    if ("$($Client.state)" -ne 'idle') { return $null }
+    if ("$($Client.client)" -notmatch '^(127\.0\.0\.1|::1)(/\d+)?$') { return $null }
+    if (-not ("$($Client.application)" -match '^(?<name>[A-Za-z0-9.]+?)(?:\.exe)?\([^)]*\):(?<pid>\d+)$')) { return $null }
+    $name = $Matches['name']
+    $procId = [int]$Matches['pid']
+    if (@(Get-VeeamPgClientProgramNames) -notcontains $name) { return $null }
+    $found = @(Get-Process -Id $procId -ErrorAction SilentlyContinue | Where-Object { "$($_.ProcessName)" -eq $name })
+    if ($found.Count -ne 1) { return $null }
+    $path = "$($found[0].Path)"
+    if (-not $path) { return $null }
+    try { $signature = Get-AuthenticodeSignature -FilePath $path -ErrorAction Stop } catch { return $null }
+    if ("$($signature.Status)" -ne 'Valid' -or "$($signature.SignerCertificate.Subject)" -notmatch 'Veeam Software') { return $null }
+    return $found[0]
+}
+
+# Close one Veeam program by force. Re-read by ID and name first: a PID can be reused
+# once the program exits, and the process that inherits it must never be touched.
+# Returns $true when the program is gone.
+function Stop-VeeamPgClientProcess {
+    param([Parameter(Mandatory)] $Process, [ValidateRange(1,120)][int] $GraceSeconds = 10)
+    $name = "$($Process.ProcessName)"
+    $procId = [int]$Process.Id
+    $isAlive = { @(Get-Process -Id $procId -ErrorAction SilentlyContinue | Where-Object { "$($_.ProcessName)" -eq $name }).Count -gt 0 }
+    if (-not (& $isAlive)) {
+        Write-Log "  the Veeam program $name PID $procId closed by itself"
+        return $true
+    }
+    $problem = ''
+    try { Stop-Process -Id $procId -Force -ErrorAction Stop } catch { $problem = "$($_.Exception.Message)" }
+    for ($i = 0; $i -lt $GraceSeconds -and (& $isAlive); $i++) { Start-Sleep -Seconds 1 }
+    if (& $isAlive) {
+        $why = if ($problem) { $problem } else { "still running after ${GraceSeconds}s" }
+        Write-Log "Could not close the Veeam program $name PID ${procId}: $why" WARN
+        return $false
+    }
+    Write-Log "Closed the Veeam program $name PID $procId by force. It was still connected to PostgreSQL, with an idle session, after every Veeam service had stopped." WARN
+    Add-ReportListItem -Field 'ProcessesClosed' -Value "${name}:PID$procId"
+    return $true
 }
 
 # True when every blocking label is an open Veeam console. Closing a console only
@@ -7284,19 +7349,60 @@ FROM pg_stat_activity
 WHERE pid <> pg_backend_pid()
   AND backend_type = 'client backend';
 "@
-$clientActivityResult = Invoke-Psql $clientActivitySql
-if ($clientActivityResult.ExitCode -ne 0 -or -not $clientActivityResult.StdOut) {
-    Complete-Run $EXIT.PREFLIGHT 'PG_CLIENT_ACTIVITY_UNVERIFIED' "Could not verify that PostgreSQL has no remaining client sessions after Veeam stopped. PostgreSQL was NOT stopped. stderr: $($clientActivityResult.StdErr)"
+function Get-RemainingPgClients {
+    $result = Invoke-Psql $clientActivitySql
+    if ($result.ExitCode -ne 0 -or -not $result.StdOut) {
+        Complete-Run $EXIT.PREFLIGHT 'PG_CLIENT_ACTIVITY_UNVERIFIED' "Could not verify that PostgreSQL has no remaining client sessions after Veeam stopped. PostgreSQL was NOT stopped. stderr: $($result.StdErr)"
+    }
+    try { return @(ConvertFrom-JsonArrayText $result.StdOut) }
+    catch {
+        Complete-Run $EXIT.PREFLIGHT 'PG_CLIENT_ACTIVITY_UNVERIFIED' "PostgreSQL client-session inventory was not valid JSON. PostgreSQL was NOT stopped: $($_.Exception.Message)"
+    }
 }
-try { $remainingPgClients = @(ConvertFrom-JsonArrayText $clientActivityResult.StdOut) }
-catch {
-    Complete-Run $EXIT.PREFLIGHT 'PG_CLIENT_ACTIVITY_UNVERIFIED' "PostgreSQL client-session inventory was not valid JSON. PostgreSQL was NOT stopped: $($_.Exception.Message)"
+
+# A Veeam program can take a while to close after its service stops. Wait for it.
+$pgClientWaitSeconds = 300
+$pgClientTimer = [Diagnostics.Stopwatch]::StartNew()
+$pgClientsLogged = ''
+while ($true) {
+    $remainingPgClients = @(Get-RemainingPgClients)
+    if ($remainingPgClients.Count -eq 0 -or $pgClientTimer.Elapsed.TotalSeconds -ge $pgClientWaitSeconds) { break }
+    $clientSummary = Format-PgClientSummary $remainingPgClients
+    if ($clientSummary -ne $pgClientsLogged) {
+        Write-Log "Waiting up to $([int]($pgClientWaitSeconds / 60)) minutes for PostgreSQL client session(s) to close after Veeam stopped: $clientSummary" WARN
+        $pgClientsLogged = $clientSummary
+    }
+    Start-Sleep -Seconds 10
 }
+
 if ($remainingPgClients.Count -gt 0) {
-    $clientSummary = @($remainingPgClients | ForEach-Object {
-        "pid=$($_.pid),user=$($_.user),db=$($_.database),app=$($_.application),client=$($_.client),state=$($_.state)"
-    }) -join ' | '
-    Complete-Run $EXIT.RETRY 'PG_CLIENTS_STILL_CONNECTED' "PostgreSQL still has untracked client connection(s) after Veeam stopped ($clientSummary). They were not terminated; close or coordinate them, then retry."
+    $clientSummary = Format-PgClientSummary $remainingPgClients
+    # Close by force only when every remaining session belongs to a Veeam program
+    # that may be closed, and every Veeam service is still stopped. Anything else
+    # (an operator, a monitor, pgAdmin) is never closed: the run stops instead.
+    $closableProcesses = @()
+    $otherClients = @()
+    foreach ($pgClient in $remainingPgClients) {
+        $veeamProcess = Resolve-VeeamPgClientProcess -Client $pgClient
+        if ($veeamProcess) { $closableProcesses += $veeamProcess } else { $otherClients += $pgClient }
+    }
+    $veeamRunningAgain = @(Get-Service -Name 'Veeam*' -ErrorAction SilentlyContinue | Where-Object { $_.Status -ne 'Stopped' })
+    if ($otherClients.Count -gt 0 -or $veeamRunningAgain.Count -gt 0) {
+        $whyNotClosed = if ($veeamRunningAgain.Count -gt 0) { 'a Veeam service is running again' } else { "not every session is an idle Veeam program this script may close ($(Format-PgClientSummary $otherClients))" }
+        Complete-Run $EXIT.RETRY 'PG_CLIENTS_STILL_CONNECTED' "PostgreSQL still has client connection(s) $([int]($pgClientWaitSeconds / 60)) minutes after Veeam stopped ($clientSummary). They were not closed, because $whyNotClosed. Close or coordinate them, then retry."
+    }
+    foreach ($veeamProcess in @($closableProcesses | Sort-Object Id -Unique)) {
+        [void](Stop-VeeamPgClientProcess -Process $veeamProcess)
+    }
+    # PostgreSQL ends a session as soon as its program exits. Allow a little time.
+    for ($i = 0; $i -lt 15; $i++) {
+        $remainingPgClients = @(Get-RemainingPgClients)
+        if ($remainingPgClients.Count -eq 0) { break }
+        Start-Sleep -Seconds 2
+    }
+    if ($remainingPgClients.Count -gt 0) {
+        Complete-Run $EXIT.RETRY 'PG_CLIENTS_STILL_CONNECTED' "PostgreSQL still has client connection(s) after Veeam stopped and its leftover programs were closed ($(Format-PgClientSummary $remainingPgClients)). They were not terminated; close or coordinate them, then retry."
+    }
 }
 Write-Log 'No other PostgreSQL client sessions remain after Veeam stopped' OK
 

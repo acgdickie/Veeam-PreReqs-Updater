@@ -93,10 +93,11 @@ The console summary and `last-result.json` hold every report field, in this orde
 24. `UnhealthyServices`
 25. `ServicesStarted`
 26. `ConsolesClosed`
-27. `Vb365SyncStuck`
-28. `RecoveryRunDir`
-29. `Detail`
-30. `LogPath`
+27. `ProcessesClosed`
+28. `Vb365SyncStuck`
+29. `RecoveryRunDir`
+30. `Detail`
+31. `LogPath`
 
 These report fields are the RMM-readable issue note for any action-bearing result. They name what is unhealthy, what remains disabled, and where recovery evidence lives.
 
@@ -109,6 +110,7 @@ These report fields are the RMM-readable issue note for any action-bearing resul
 | `WshStatus` | What happened to Windows Script Host. See [Windows Script Host and Veeam hardening](windows-script-host.md) |
 | `ServicesStarted` | Stopped automatic Veeam services that the run started to rescue a failed configuration backup |
 | `ConsolesClosed` | The Veeam consoles that the run closed |
+| `ProcessesClosed` | Leftover Veeam programs that the run closed by force, because they stayed connected to PostgreSQL after every Veeam service stopped. See [Other PostgreSQL clients](how-it-works.md#other-postgresql-clients) |
 | `Vb365SyncStuck` | Any VB365 organisation whose data sync is stuck. VB365 needs attention there |
 | `last-result.json` | Every report field, in the order above, the same as the console summary |
 | `result.json` | The same result, written to the run folder when the run has one. `-Install` creates one; `-Recover` uses the interrupted run's |

@@ -160,7 +160,9 @@ After the jobs are disabled:
 
 After the services and NATS are stopped:
 
-1. Checks nothing else is connected to PostgreSQL.
+1. Checks nothing else is connected to PostgreSQL. It waits up to 5 minutes for
+   connections to close, and can close a leftover Veeam program (see
+   [Other PostgreSQL clients](#other-postgresql-clients)).
 2. Dumps any cache database VB365 created meanwhile.
 3. Stops PostgreSQL.
 
@@ -411,7 +413,18 @@ startup type is still restored.
 After Veeam is stopped, the script queries `pg_stat_activity`. It refuses to stop
 PostgreSQL while any other client session remains.
 
-- **Result:** it reports exit `10` and the client details for the RMM.
-- **Never kills:** it never terminates those sessions.
+- **Wait:** it checks every 10 seconds, for up to 5 minutes. A Veeam program can take a
+  while to close after its service stops.
+- **Leftover Veeam programs:** `Veeam.Backup.Manager.exe` and `Veeam.Backup.Satellite.exe`
+  are started by the Veeam services but are not services, so they can stay connected.
+  After the wait, the script closes them by force, only when all of this is true:
+  - every remaining session belongs to one of these two programs;
+  - each session is idle and comes from this server;
+  - the program runs from a file signed by Veeam;
+  - every Veeam service is still stopped.
+
+  `ProcessesClosed` names each program it closed.
+- **Anything else:** an operator, a monitor or pgAdmin is never closed. The run reports
+  exit `10` and the client details for the RMM, and puts everything back.
 
 [Back to the README](../README.md) · [All docs](README.md)
