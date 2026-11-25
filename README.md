@@ -128,8 +128,8 @@ full rules are in [Scope and known limits](docs/scope-and-limits.md).
   can wait more than once. The installer gets up to 2 hours more.
 - It all happens in one run. The outage starts when Veeam goes quiet, which can be hours after
   the run starts.
-- **It closes open Veeam consoles** (VBR and VB365) once they are the only thing in the way.
-  Unsaved work in them is lost. It never closes a Veeam Explorer. It waits for the Explorer
+- **It closes open Veeam consoles** (VBR and VB365) at the start, and again later if one is
+  opened and is the only thing in the way. Unsaved work in them is lost. It never closes a Veeam Explorer. It waits for the Explorer
   to close, then returns `10`, or `40` with jobs left off if it is still open after the update.
 - A PostgreSQL update needs a restart:
   - Without `-Reboot`, the run returns `6` (`8` on an end-of-life branch). The jobs are back

@@ -3589,7 +3589,10 @@ function Get-VeeamJobFamilyDefinitions {
             [pscustomobject]@{ Family='VBRStorageCopy'; Get='Get-VBRStorageCopyJob';          Disable='Disable-VBRStorageCopyJob';          Enable='Enable-VBRStorageCopyJob';          Argument='Job';             Transition='Command';      Required=$false; Enabled=@() },
             [pscustomobject]@{ Family='VBRCDP';         Get='Get-VBRCDPPolicy';               Disable='Disable-VBRCDPPolicy';               Enable='Enable-VBRCDPPolicy';               Argument='Policy';          Transition='Command';      Required=$false; Enabled=@('PolicyState','IsEnabled','Enabled') },
             [pscustomobject]@{ Family='VBRvCDReplica';  Get='Get-VBRvCDReplicaJob';           Disable='Disable-VBRvCDReplicaJob';           Enable='Enable-VBRvCDReplicaJob';           Argument='Job';             Transition='Command';      Required=$false; Enabled=@('ScheduleEnabled','IsScheduleEnabled','IsEnabled') },
-            [pscustomobject]@{ Family='VBRUnstructured';Get='Get-VBRUnstructuredBackupJob';   Disable='Set-VBRNASBackupJob';                Enable='Set-VBRObjectStorageBackupJob';     Argument='Job';             Transition='Unstructured'; Required=$false; Enabled=@('ScheduleEnabled','IsScheduleEnabled') },
+            # File share and object storage jobs: the console's Disable (Disable-VBRJob on
+            # Veeam's CBackupJob), never Set-VBRNASBackupJob -EnableSchedule, which deletes
+            # the schedule. The state is read from CBackupJob too: see Get-VeeamJobEnabledFlag.
+            [pscustomobject]@{ Family='VBRUnstructured';Get='Get-VBRUnstructuredBackupJob';   Disable='Disable-VBRJob';                     Enable='Enable-VBRJob';                     Argument='Job';             Transition='CoreJob';      Required=$false; Enabled=@('CBackupJob.IsScheduleEnabled') },
             [pscustomobject]@{ Family='VBRUnstructuredCopy';Get='Get-VBRUnstructuredBackupCopyJob';Disable='Disable-VBRJob';                 Enable='Enable-VBRJob';                     Argument='Job';             Transition='Command';      Required=$false; Enabled=@('IsScheduleEnabled','ScheduleEnabled','IsEnabled') },
             [pscustomobject]@{ Family='VBREntraTenant'; Get='Get-VBREntraIDTenantBackupJob';  Disable='Set-VBREntraIDTenantBackupJob';      Enable='Set-VBREntraIDTenantBackupJob';      Argument='Job';             Transition='ScheduleSwitch';Required=$false; Enabled=@('EnableSchedule','ScheduleEnabled') },
             [pscustomobject]@{ Family='VBREntraLogs';   Get='Get-VBREntraIDLogsBackupJob';    Disable='Set-VBREntraIDLogsBackupJob';        Enable='Set-VBREntraIDLogsBackupJob';        Argument='Job';             Transition='ScheduleSwitch';Required=$false; Enabled=@('ScheduleEnabled','EnableSchedule') },
@@ -3613,10 +3616,11 @@ function Get-VeeamJobFamilyDefinition {
     return $def[0]
 }
 
-# Whether a job is enabled, from Veeam's own CBackupJob (Veeam.Backup.Core). Not a
-# supported API, but Veeam's product management names it as the way to read this for
-# application backup policies. $null when the type or the job cannot be read.
-function Get-VeeamCoreJobScheduleFlag {
+# Veeam's own CBackupJob (Veeam.Backup.Core) for a job ID. Not a supported API, but
+# Veeam's product management names it as the way to read whether an application backup
+# policy is enabled, and Disable-VBRJob and Enable-VBRJob take it. $null when the type
+# or the job cannot be read.
+function Get-VeeamCoreJob {
     param([Parameter(Mandatory)] $Id)
     try {
         $coreType = 'Veeam.Backup.Core.CBackupJob' -as [type]
@@ -3628,10 +3632,17 @@ function Get-VeeamCoreJobScheduleFlag {
             } | Where-Object { $_ }) | Select-Object -First 1
         }
         if (-not $coreType) { return $null }
-        $core = $coreType::Find([guid]"$Id")
-        if ($null -eq $core -or $core.PSObject.Properties.Name -notcontains 'IsScheduleEnabled') { return $null }
-        return [bool]$core.IsScheduleEnabled
+        return $coreType::Find([guid]"$Id")
     } catch { return $null }
+}
+
+# Whether a job is enabled (the console's Disable), from its CBackupJob. $null when it
+# cannot be read.
+function Get-VeeamCoreJobScheduleFlag {
+    param([Parameter(Mandatory)] $Id)
+    $core = Get-VeeamCoreJob -Id $Id
+    if ($null -eq $core -or $core.PSObject.Properties.Name -notcontains 'IsScheduleEnabled') { return $null }
+    return [bool]$core.IsScheduleEnabled
 }
 
 function Get-VeeamJobEnabledFlag {
@@ -3640,10 +3651,13 @@ function Get-VeeamJobEnabledFlag {
     # property: its ScheduleEnabled stays True when the policy is disabled. Checked on
     # VBR 12.3: CBackupJob's IsScheduleEnabled is False after Disable and True after
     # Enable. Without it the state is unknown, so refuse rather than guess.
-    if ("$($Definition.Family)" -eq 'VBRApplication') {
+    # A file share or object storage job is turned off with the console's Disable, which
+    # its ScheduleEnabled does not show: ScheduleEnabled is "Run the job automatically".
+    if ("$($Definition.Family)" -in @('VBRApplication','VBRUnstructured')) {
         $coreFlag = Get-VeeamCoreJobScheduleFlag -Id $Job.Id
         if ($null -eq $coreFlag) {
-            throw [System.NotSupportedException]::new("VBRApplication policy '$($Job.Name)': its PowerShell object has no enabled property, and Veeam's CBackupJob could not be read, so whether it is enabled is unknown")
+            $what = if ("$($Definition.Family)" -eq 'VBRApplication') { "policy '$($Job.Name)': its PowerShell object has no enabled property, and" } else { "job '$($Job.Name)':" }
+            throw [System.NotSupportedException]::new("$($Definition.Family) $what Veeam's CBackupJob could not be read, so whether it is enabled is unknown")
         }
         return $coreFlag
     }
@@ -3654,6 +3668,22 @@ function Get-VeeamJobEnabledFlag {
         }
     }
     throw [System.NotSupportedException]::new("$($Definition.Family) object '$($Job.Name)' exposes none of the expected enabled properties: $($Definition.Enabled -join ', ')")
+}
+
+# A job's schedule as text, to prove that turning the job off and on did not change it.
+# Only file share and object storage jobs have one here: their own Set- commands delete
+# the schedule, so a wrong command must be caught. Other families return ''. A schedule
+# that cannot be read is an error, so the run never changes a job it cannot check.
+function Get-VeeamJobScheduleFingerprint {
+    param([Parameter(Mandatory)] $Job, [Parameter(Mandatory)] $Definition)
+    if ("$($Definition.Family)" -ne 'VBRUnstructured') { return '' }
+    $names = @($Job.PSObject.Properties.Name)
+    if ($names -notcontains 'ScheduleEnabled' -or $names -notcontains 'ScheduleOptions') {
+        throw [System.NotSupportedException]::new("VBRUnstructured job '$($Job.Name)' has no ScheduleEnabled or ScheduleOptions, so its schedule cannot be checked")
+    }
+    try { $options = $Job.ScheduleOptions | ConvertTo-Json -Depth 4 -Compress -WarningAction SilentlyContinue -ErrorAction Stop }
+    catch { throw "VBRUnstructured job '$($Job.Name)': its schedule could not be read: $($_.Exception.Message)" }
+    return "automatic=$([bool]$Job.ScheduleEnabled); $options"
 }
 
 function Get-VeeamJobIdentity {
@@ -3682,9 +3712,6 @@ function Get-VeeamManagedJobInventory {
             continue
         }
         $requiredTransitions = @($def.Disable, $def.Enable)
-        if ($def.Transition -eq 'Unstructured') {
-            $requiredTransitions = @('Set-VBRNASBackupJob','Set-VBRObjectStorageBackupJob')
-        }
         foreach ($needed in $requiredTransitions) {
             if (-not (Get-Command $needed -ErrorAction SilentlyContinue)) {
                 throw [System.NotSupportedException]::new("$($def.Get) is available but $needed is not; $($def.Family) cannot be round-tripped safely")
@@ -3743,17 +3770,18 @@ function Invoke-VeeamJobTransition {
         & $commandName @invokeArgs | Out-Null
         return
     }
-    if ($Definition.Transition -eq 'Unstructured') {
-        $typeName = $Job.GetType().Name
-        if ($typeName -match 'ObjectStorage') { $commandName = 'Set-VBRObjectStorageBackupJob' }
-        elseif ($typeName -match 'NAS|File')  { $commandName = 'Set-VBRNASBackupJob' }
-        else { throw [System.NotSupportedException]::new("Unknown unstructured job subtype '$typeName' for '$($Job.Name)'") }
-        # These Set- commands check the whole job again. A job warning, such as "Potential
-        # data sovereignty violation" when source and target location tags differ, stops
-        # them unless -Force is given. The caller still verifies the new schedule state.
-        $invokeArgs = @{ Job=$Job; EnableSchedule=$enableValue; ErrorAction='Stop'; WarningAction='SilentlyContinue'; WarningVariable='veeamWarnings' }
-        if ((Get-Command $commandName -ErrorAction Stop).Parameters.ContainsKey('Force')) { $invokeArgs['Force'] = $true }
-        & $commandName @invokeArgs | Out-Null
+    if ($Definition.Transition -eq 'CoreJob') {
+        # File share and object storage jobs. Set-VBRNASBackupJob and
+        # Set-VBRObjectStorageBackupJob -EnableSchedule switch "Run the job automatically"
+        # off, which deletes the job's schedule. Disable-VBRJob is the console's Disable:
+        # the job keeps its schedule. It takes the job's CBackupJob. The caller checks the
+        # new state, and that the schedule did not change.
+        $core = Get-VeeamCoreJob -Id $Job.Id
+        if ($null -eq $core) {
+            throw [System.NotSupportedException]::new("$($Definition.Family) '$($Job.Name)': Veeam's CBackupJob could not be read, so it cannot be turned $(if ($enableValue) { 'on' } else { 'off' }) safely")
+        }
+        $commandName = if ($Action -eq 'Disable') { $Definition.Disable } else { $Definition.Enable }
+        & $commandName -Job $core -ErrorAction Stop -WarningAction SilentlyContinue -WarningVariable veeamWarnings | Out-Null
         foreach ($warning in $veeamWarnings) {
             Write-Log "  Veeam warned about $($Definition.Family) '$($Job.Name)': $(Format-ShortText "$warning" 200)"
         }
@@ -3800,6 +3828,14 @@ function Enable-VeeamJobById {
     if (-not (Get-VeeamJobEnabledFlag -Job $verify.Job -Definition $verify.Definition)) {
         throw "$($JobRecord.Family) '$($JobRecord.Name)' is still disabled after Enable"
     }
+    # The job is on. A schedule that is not the same as before is a warning, not a
+    # failure: the job must stay on, and a person has to check the schedule.
+    if ($recordNames -contains 'ScheduleBefore' -and "$($JobRecord.ScheduleBefore)") {
+        $scheduleNow = try { Get-VeeamJobScheduleFingerprint -Job $verify.Job -Definition $verify.Definition } catch { "(unreadable: $($_.Exception.Message))" }
+        if ($scheduleNow -ne "$($JobRecord.ScheduleBefore)") {
+            Write-Log "  $($JobRecord.Family) '$($JobRecord.Name)' is on again, but its schedule is not the same as before this run. Check it in the Veeam console. Before: $(Format-ShortText "$($JobRecord.ScheduleBefore)" 300)" WARN
+        }
+    }
     return $switched
 }
 
@@ -3823,6 +3859,7 @@ function Disable-VeeamManagedJobs {
             DisableAttempted = $false
             Disabled   = $false
             Restored   = $false
+            ScheduleBefore = ''
         }
     })
     Save-DisabledJobState
@@ -3833,6 +3870,8 @@ function Disable-VeeamManagedJobs {
         if (-not (Get-VeeamJobEnabledFlag -Job $found.Job -Definition $found.Definition)) {
             throw "$($record.Family) '$($record.Name)' changed to disabled before this run could disable it; refusing an ambiguous round trip"
         }
+        $scheduleBefore = Get-VeeamJobScheduleFingerprint -Job $found.Job -Definition $found.Definition
+        $record.ScheduleBefore = $scheduleBefore
         # Recorded before the call: from here this run may have turned the job off, so
         # every way back switches it on again, whatever the next check says.
         $record.DisableAttempted = $true
@@ -3841,6 +3880,9 @@ function Disable-VeeamManagedJobs {
         $verify = Get-VeeamJobByRecord $record
         if (Get-VeeamJobEnabledFlag -Job $verify.Job -Definition $verify.Definition) {
             throw "$($record.Family) '$($record.Name)' is still enabled after Disable"
+        }
+        if ((Get-VeeamJobScheduleFingerprint -Job $verify.Job -Definition $verify.Definition) -ne $scheduleBefore) {
+            throw "$($record.Family) '$($record.Name)': its schedule changed when it was turned off. Check its schedule in the Veeam console."
         }
         $record.Disabled = $true
         Save-DisabledJobState
@@ -4757,7 +4799,8 @@ function Get-ActiveVeeamWork {
                 if ($freshJob.PSObject.Properties.Name -notcontains 'IsRunning') {
                     throw [System.NotSupportedException]::new("$($entry.Family) '$($entry.Name)' lost its IsRunning activity property during refresh")
                 }
-                if ($freshJob.IsRunning -eq $true) { $active += "$($entry.Family):IsRunning" }
+                # Name the job, so a long wait says which job holds it.
+                if ($freshJob.IsRunning -eq $true) { $active += "$($entry.Family):IsRunning:$($entry.Name)" }
             }
         }
     }
@@ -5611,6 +5654,19 @@ if ($hasEnterpriseManager -and -not $hasVbr) {
 
 if ($hasVbr -and $hasVb365) {
     Complete-Run $EXIT.UNSUPPORTED 'STACKED_VBR_VB365' 'Combined VBR+VB365 servers require a separate certified profile, especially for tuning and recovery. This initial production profile supports one of those products at a time.'
+}
+
+# An -Install run closes every open Veeam console now, at the start, by force if it must.
+# A console is only a client: jobs and restores run in the Veeam services (KB2991). Left
+# open, it holds every later wait for Veeam work. A console opened during the run is
+# closed by the waits, once it is the only thing left. Explorers stay open: they run
+# their own restores. An audit closes nothing.
+if ($Install) {
+    $startConsoles = @(Get-VeeamConsoleProcesses -Vbr $hasVbr -Vb365 $hasVb365)
+    if ($startConsoles.Count -gt 0) {
+        Write-Log "Closing $($startConsoles.Count) open Veeam console(s) at the start of this -Install run." WARN
+        [void](Close-VeeamConsoleProcesses -Vbr $hasVbr -Vb365 $hasVb365)
+    }
 }
 
 # ---------------------------------------------------------------------------

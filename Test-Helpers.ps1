@@ -40,8 +40,8 @@ $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
         'Get-PolicyExitCode','Get-RmmActionForExitCode','Invoke-DelayedReboot',
         'Resolve-PgInstallerLinkFromHtml',
         'Get-VeeamJobFamilyDefinitions','Get-VeeamJobFamilyDefinition',
-        'Get-VeeamCoreJobScheduleFlag','Get-VeeamJobEnabledFlag','Get-VeeamJobIdentity','Get-VeeamManagedJobInventory',
-        'Invoke-VeeamJobTransition','Get-VeeamJobByRecord','Enable-VeeamJobById',
+        'Get-VeeamCoreJob','Get-VeeamCoreJobScheduleFlag','Get-VeeamJobEnabledFlag','Get-VeeamJobScheduleFingerprint','Get-VeeamJobIdentity','Get-VeeamManagedJobInventory',
+        'Invoke-VeeamJobTransition','Get-VeeamJobByRecord','Enable-VeeamJobById','Disable-VeeamManagedJobs',
         'Get-ActiveLabelsFromSessions','Get-ActiveVb365OrganizationSyncWork','Get-Vb365QueuedSyncTiming','Write-Vb365StuckSyncOnce','Test-VbrFamilyInUse','Get-BlockingVeeamUiProcesses',
         'Get-ActiveVeeamWork','Wait-VeeamIdle','Find-Vb365MaintenanceBarrier','Start-Vb365MaintenanceBarrier',
         'Get-UnrestoredJobNames',
@@ -614,37 +614,78 @@ Check 'application policy: never read from ScheduleEnabled' (@($appDef.Enabled) 
     Check 'rollback: an untouched enabled job is left alone' "$(Enable-VeeamJobById $untouchedRecord) $script:EnableCalls" 'False 1'
     Check 'rollback: a record without DisableAttempted but Disabled is switched on' "$(Enable-VeeamJobById $oldRecord) $script:EnableCalls" 'True 2'
 }
-# Unstructured jobs (file share, object storage): the Set- commands check the whole job
-# again, and a location-tag warning ("Potential data sovereignty violation") stops them
-# unless -Force is given. Seen on a real VBR 12.3 server with Azure targets.
-if (-not ('VeeamPgTestNASBackupJob' -as [type])) {
-    Add-Type -TypeDefinition 'public class VeeamPgTestNASBackupJob { public string Name = "Example File Share Job"; } public class VeeamPgTestObjectStorageBackupJob { public string Name = "Example Blob Job"; }'
-}
+# File share and object storage jobs: turned off and on with the console's Disable
+# (Disable-VBRJob on Veeam's CBackupJob). Set-VBRNASBackupJob -EnableSchedule switches
+# "Run the job automatically" off and deletes the schedule, as seen on a real VBR 12.3
+# server, so the script must never use the Set- commands.
+$unstructuredDef = Get-VeeamJobFamilyDefinition 'VBRUnstructured'
+Check 'unstructured: off and on with the console Disable' "$($unstructuredDef.Disable) $($unstructuredDef.Enable) $($unstructuredDef.Transition)" 'Disable-VBRJob Enable-VBRJob CoreJob'
+Check 'unstructured: state read from CBackupJob' (@($unstructuredDef.Enabled) -join ',') 'CBackupJob.IsScheduleEnabled'
+$setCommandUses = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.StringConstantExpressionAst] -and "$($args[0].Value)" -match '^Set-VBR(NAS|ObjectStorage)BackupJob$' }, $true))
+Check 'unstructured: the script never calls the Set- commands' $setCommandUses.Count 0
 & {
-    $script:SetCalls = @()
+    $script:CoreCalls = @()
     $script:Logged = @()
     function Write-Log { param($Message, $Level) $script:Logged += "$Message" }
-    function Set-VBRNASBackupJob {
-        [CmdletBinding()] param($Job, [switch] $EnableSchedule, [switch] $Force)
-        if (-not $Force) { throw 'Potential data sovereignty violation: original and target computer locations do not match.' }
-        Write-Warning "Potential data sovereignty violation: original and target computer locations do not match.`nOriginal location: No location tag"
-        $script:SetCalls += "NAS $([bool]$EnableSchedule)"
-    }
-    function Set-VBRObjectStorageBackupJob {
-        [CmdletBinding()] param($Job, [switch] $EnableSchedule, [switch] $Force)
-        if (-not $Force) { throw 'Potential data sovereignty violation' }
-        $script:SetCalls += "ObjectStorage $([bool]$EnableSchedule)"
-    }
-    $unstructuredDef = Get-VeeamJobFamilyDefinition 'VBRUnstructured'
-    $nasJob = New-Object VeeamPgTestNASBackupJob
-    $blobJob = New-Object VeeamPgTestObjectStorageBackupJob
-    Check 'unstructured: file share off passes the location warning' (Throws { Invoke-VeeamJobTransition -Definition $unstructuredDef -Job $nasJob -Action Disable }) 'False'
-    Check 'unstructured: file share on passes it too' (Throws { Invoke-VeeamJobTransition -Definition $unstructuredDef -Job $nasJob -Action Enable }) 'False'
-    Check 'unstructured: object storage off and on pass it' (Throws { Invoke-VeeamJobTransition -Definition $unstructuredDef -Job $blobJob -Action Disable; Invoke-VeeamJobTransition -Definition $unstructuredDef -Job $blobJob -Action Enable }) 'False'
-    Check 'unstructured: the right command and state each time' ($script:SetCalls -join ', ') 'NAS False, NAS True, ObjectStorage False, ObjectStorage True'
-    Check 'unstructured: the warning is logged on one line' (@($script:Logged | Where-Object { $_ -like "*VBRUnstructured 'Example File Share Job': Potential data sovereignty violation*Original location: No location tag" }).Count) 2
-    Check 'unstructured: no warning, nothing logged' (@($script:Logged | Where-Object { $_ -like '*Example Blob Job*' }).Count) 0
+    function Get-VeeamCoreJob { param($Id) if ("$Id" -eq 'no-core') { $null } else { [pscustomobject]@{ Id = "$Id" } } }
+    function Disable-VBRJob { [CmdletBinding()] param($Job) Write-Warning 'Example Veeam warning'; $script:CoreCalls += "Disable $($Job.Id)" }
+    function Enable-VBRJob  { [CmdletBinding()] param($Job) $script:CoreCalls += "Enable $($Job.Id)" }
+    function Set-VBRNASBackupJob { [CmdletBinding()] param($Job, [switch] $EnableSchedule, [switch] $Force) $script:CoreCalls += 'Set-VBRNASBackupJob' }
+    $fileJob = [pscustomobject]@{ Id = 'file-1'; Name = 'Example File Share Job' }
+    Invoke-VeeamJobTransition -Definition $unstructuredDef -Job $fileJob -Action Disable
+    Invoke-VeeamJobTransition -Definition $unstructuredDef -Job $fileJob -Action Enable
+    Check 'unstructured: Disable-VBRJob, then Enable-VBRJob, on its CBackupJob' ($script:CoreCalls -join ', ') 'Disable file-1, Enable file-1'
+    Check 'unstructured: a Veeam warning is logged on one line' (@($script:Logged | Where-Object { $_ -like "*VBRUnstructured 'Example File Share Job': Example Veeam warning" }).Count) 1
+    Check 'unstructured: no CBackupJob, no change' (Throws { Invoke-VeeamJobTransition -Definition $unstructuredDef -Job ([pscustomobject]@{ Id = 'no-core'; Name = 'x' }) -Action Disable }) 'True'
+    Check 'unstructured: nothing else was called' $script:CoreCalls.Count 2
 }
+& {
+    function Get-VeeamCoreJobScheduleFlag { param($Id) $script:CoreFlagFake }
+    $scheduledFileJob = [pscustomobject]@{ Id = [guid]'22222222-3333-4444-5555-666666666666'; Name = 'Example File Share Job'; ScheduleEnabled = $true }
+    $script:CoreFlagFake = $false
+    Check 'unstructured: off in the console although its schedule is on' (Get-VeeamJobEnabledFlag $scheduledFileJob $unstructuredDef) 'False'
+    $script:CoreFlagFake = $true
+    Check 'unstructured: on, from CBackupJob' (Get-VeeamJobEnabledFlag $scheduledFileJob $unstructuredDef) 'True'
+    $script:CoreFlagFake = $null
+    Check 'unstructured: unknown state fails closed' (Throws { Get-VeeamJobEnabledFlag $scheduledFileJob $unstructuredDef }) 'True'
+}
+# The schedule as text: the same schedule gives the same text, and any change shows.
+function New-TestScheduledJob { param([bool] $Automatic = $true, [string] $Time = '22:00')
+    [pscustomobject]@{ Id = 'sched-1'; Name = 'Example Blob Job'; ScheduleEnabled = $Automatic; ScheduleOptions = [pscustomobject]@{ Type = 'Weekly'; Day = 'Saturday'; Time = $Time } } }
+$scheduleText = Get-VeeamJobScheduleFingerprint (New-TestScheduledJob) $unstructuredDef
+Check 'schedule text: other families have none'       (Get-VeeamJobScheduleFingerprint (New-TestScheduledJob) (Get-VeeamJobFamilyDefinition 'VBRJob')) ''
+Check 'schedule text: same schedule, same text'       ($scheduleText -eq (Get-VeeamJobScheduleFingerprint (New-TestScheduledJob) $unstructuredDef)) 'True'
+Check 'schedule text: automatic off is a change'      ($scheduleText -eq (Get-VeeamJobScheduleFingerprint (New-TestScheduledJob -Automatic $false) $unstructuredDef)) 'False'
+Check 'schedule text: a new time is a change'         ($scheduleText -eq (Get-VeeamJobScheduleFingerprint (New-TestScheduledJob -Time '10:00') $unstructuredDef)) 'False'
+Check 'schedule text: no schedule fields fails closed' (Throws { Get-VeeamJobScheduleFingerprint ([pscustomobject]@{ Name = 'x' }) $unstructuredDef }) 'True'
+# Turning a job off must not change its schedule. If it does, the run stops there, and
+# the rollback switches the job on again and warns that its schedule changed.
+& {
+    $script:Logged = @()
+    function Write-Log { param($Message, $Level) $script:Logged += "$Message" }
+    function Save-DisabledJobState {}
+    function Save-RecoveryState { param($Stage, $InstallerStarted) }
+    function Get-VeeamJobByRecord { param($JobRecord) [pscustomobject]@{ Definition = $unstructuredDef; Job = $script:GuardJob } }
+    function Get-VeeamJobEnabledFlag { param($Job, $Definition) $script:GuardOn }
+    function Invoke-VeeamJobTransition { param($Definition, $Job, $Action)
+        $script:GuardOn = ($Action -eq 'Enable')
+        if ($script:WipeSchedule) { $script:GuardJob = New-TestScheduledJob -Automatic $false } }
+    $guardInventory = @([pscustomobject]@{ Family = 'VBRUnstructured'; Id = 'sched-1'; Name = 'Example Blob Job'; Enabled = $true; Object = (New-TestScheduledJob) })
+
+    $script:GuardJob = New-TestScheduledJob; $script:GuardOn = $true; $script:WipeSchedule = $false
+    Check 'disable: a kept schedule passes' (Throws { Disable-VeeamManagedJobs -Inventory $guardInventory }) 'False'
+    Check 'disable: the schedule is saved in the record' ("$($script:DisabledJobs[0].ScheduleBefore)" -like 'automatic=True;*Saturday*') 'True'
+    $script:Logged = @()
+    [void](Enable-VeeamJobById $script:DisabledJobs[0])
+    Check 'enable: a kept schedule gives no warning' (@($script:Logged | Where-Object { $_ -like '*schedule is not the same*' }).Count) 0
+
+    $script:GuardJob = New-TestScheduledJob; $script:GuardOn = $true; $script:WipeSchedule = $true
+    Check 'disable: a deleted schedule stops the run' (Throws { Disable-VeeamManagedJobs -Inventory $guardInventory }) 'True'
+    $script:Logged = @()
+    [void](Enable-VeeamJobById $script:DisabledJobs[0])
+    Check 'enable: a changed schedule is a warning' (@($script:Logged | Where-Object { $_ -like "*VBRUnstructured 'Example Blob Job' is on again, but its schedule is not the same as before this run*" }).Count) 1
+}
+Check 'install: open consoles are closed at the start' ($scriptText.IndexOf('at the start of this -Install run') -gt 0 -and $scriptText.IndexOf('at the start of this -Install run') -lt $scriptText.IndexOf("Write-Log 'STEP 4 - Confirm database engine'")) 'True'
 $disableBody = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Disable-VeeamManagedJobs' }, $true))[0].Extent.Text
 $attemptAt = $disableBody.IndexOf('$record.DisableAttempted = $true')
 Check 'disable: the attempt is saved before the Veeam call' ($attemptAt -gt 0 -and $disableBody.IndexOf('Save-DisabledJobState', $attemptAt) -lt $disableBody.IndexOf('-Action Disable', $attemptAt)) 'True'
@@ -850,14 +891,14 @@ $script:ManagedJobInventory = @([pscustomobject]@{
 $script:FakeVbrJobIsRunning = $true
 function Get-VBRJob { [CmdletBinding()] param() [pscustomobject]@{ Id='running-flag'; Name='running'; IsRunning=$script:FakeVbrJobIsRunning } }
 $w = @(Get-ActiveVeeamWork -Vbr $true -Vb365 $false)
-Check 'job IsRunning flag is additional busy signal' ($w -contains 'VBRJob:IsRunning') 'True'
+Check 'job IsRunning flag is additional busy signal' ($w -contains 'VBRJob:IsRunning:running') 'True'
 $script:FakeVbrJobIsRunning = $false
 $w = @(Get-ActiveVeeamWork -Vbr $true -Vb365 $false)
-Check 'stale true IsRunning snapshot does not block forever' ($w -contains 'VBRJob:IsRunning') 'False'
+Check 'stale true IsRunning snapshot does not block forever' ($w -contains 'VBRJob:IsRunning:running') 'False'
 $script:ManagedJobInventory[0].Object.IsRunning = $false
 $script:FakeVbrJobIsRunning = $true
 $w = @(Get-ActiveVeeamWork -Vbr $true -Vb365 $false)
-Check 'fresh true IsRunning catches a newly-started job' ($w -contains 'VBRJob:IsRunning') 'True'
+Check 'fresh true IsRunning catches a newly-started job' ($w -contains 'VBRJob:IsRunning:running') 'True'
 $script:ManagedJobInventory = @()
 
 $script:FakeVboSessions = @((V 'Success'), (V 'Running'), (V 'Queued'), (V 'Updating'), (V 'Disconnected'), (V 'Stopped'))
@@ -2094,9 +2135,21 @@ $consoleClosers = @($ast.FindAll({
 }, $true) | ForEach-Object {
     $p = $_.Parent
     while ($p -and -not ($p -is [System.Management.Automation.Language.FunctionDefinitionAst])) { $p = $p.Parent }
-    [pscustomobject]@{ Name = $_.GetCommandName(); Owner = $(if ($p) { $p.Name } else { '<script body>' }); Offset = $_.Extent.StartOffset }
+    # Inside the body of an "if ($Install)": an audit never runs it.
+    $installOnly = $false
+    $q = $_
+    while ($q.Parent) {
+        if ($q.Parent -is [System.Management.Automation.Language.IfStatementAst]) {
+            foreach ($clause in $q.Parent.Clauses) {
+                if ([object]::ReferenceEquals($clause.Item2, $q) -and "$($clause.Item1.Extent.Text)" -eq '$Install') { $installOnly = $true }
+            }
+        }
+        $q = $q.Parent
+    }
+    [pscustomobject]@{ Name = $_.GetCommandName(); Owner = $(if ($p) { $p.Name } else { '<script body>' }); Offset = $_.Extent.StartOffset; InstallOnly = $installOnly }
 })
-$closersBeforeAuditExit = @($consoleClosers | Where-Object { $_.Owner -eq '<script body>' -and $_.Offset -lt $auditExit })
+$closersBeforeAuditExit = @($consoleClosers | Where-Object { $_.Owner -eq '<script body>' -and $_.Offset -lt $auditExit -and -not $_.InstallOnly })
+Check 'only -Install closes a console at the start' @($consoleClosers | Where-Object { $_.Owner -eq '<script body>' -and $_.Offset -lt $auditExit -and $_.InstallOnly }).Count 1
 # Inside functions, only the idle wait closes, and only recovery and the NATS -Install run
 # (never audit) close that way. Audit exits before the NATS run starts (checked below).
 $strayClosers = @($consoleClosers | Where-Object { $_.Owner -ne '<script body>' -and -not (
