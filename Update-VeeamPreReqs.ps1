@@ -347,7 +347,8 @@ function Write-Log {
 function Write-AtomicText {
     param(
         [Parameter(Mandatory)][string] $Path,
-        [Parameter(Mandatory)][AllowEmptyString()][string] $Value
+        [Parameter(Mandatory)][AllowEmptyString()][string] $Value,
+        [ValidateRange(1,20)][int] $Attempts = 10
     )
     $parent = Split-Path -Parent $Path
     if ($parent -and -not (Test-Path -LiteralPath $parent)) {
@@ -356,11 +357,23 @@ function Write-AtomicText {
     $tmp = "$Path.tmp.$PID.$([guid]::NewGuid().ToString('N'))"
     try {
         Set-Content -LiteralPath $tmp -Value $Value -Encoding UTF8 -ErrorAction Stop
-        if (Test-Path -LiteralPath $Path) {
-            try { [IO.File]::Replace($tmp, $Path, $null, $true) }
-            catch { Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop }
-        } else {
-            Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop
+        # Another program, such as antivirus, can hold the file open for a moment after
+        # the last write. Then the swap fails, for example with "Cannot create a file
+        # when that file already exists" (seen on a real server, one second after the
+        # previous save). Try again for up to about 9 seconds before giving up.
+        for ($attempt = 1; $true; $attempt++) {
+            try {
+                if (Test-Path -LiteralPath $Path) {
+                    try { [IO.File]::Replace($tmp, $Path, $null, $true) }
+                    catch { Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop }
+                } else {
+                    Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop
+                }
+                break
+            } catch {
+                if ($attempt -ge $Attempts -or -not (Test-Path -LiteralPath $tmp)) { throw }
+                Start-Sleep -Milliseconds (200 * $attempt)
+            }
         }
     } finally {
         Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
@@ -2275,8 +2288,8 @@ function Invoke-NatsOnlyUpdate {
         try {
             $switched = Enable-VeeamJobById $j
             $j.Restored = $true
-            Save-DisabledJobState
             Write-Log $(if ($switched) { "  re-enabled $($j.Family): $($j.Name)" } else { "  $($j.Family): $($j.Name) was never turned off; still enabled" })
+            Save-RestoredJobState $j
         }
         catch { $failedJobs += "$($j.Name) ($($_.Exception.Message))"; Write-Log "  COULD NOT re-enable $($j.Name): $($_.Exception.Message)" ERROR }
     }
@@ -2478,8 +2491,8 @@ function Invoke-Rollback {
             try {
                 $switched = Enable-VeeamJobById $j
                 if ($j.PSObject.Properties.Name -contains 'Restored') { $j.Restored = $true }
-                Save-DisabledJobState
                 Write-Log $(if ($switched) { "  re-enabled $($j.Family): $($j.Name)" } else { "  $($j.Family): $($j.Name) was never turned off; still enabled" })
+                Save-RestoredJobState $j
             } catch { $problems += "job '$($j.Name)': $($_.Exception.Message)" }
         }
     } else {
@@ -3855,6 +3868,15 @@ function Enable-VeeamJobById {
 function Save-DisabledJobState {
     if (-not (Test-Path -LiteralPath $script:RunDir)) { return }
     Write-AtomicJson -Path (Join-Path $script:RunDir 'disabled-jobs.json') -InputObject @($script:DisabledJobs) -Depth 5
+}
+
+# Save the record after a job is back on. The job is on whatever happens here, so a
+# failed save is a warning, never "could not re-enable". A stale record is safe: a
+# recovery only switches a job on again.
+function Save-RestoredJobState {
+    param([Parameter(Mandatory)] $Job)
+    try { Save-DisabledJobState }
+    catch { Write-Log "  $($Job.Family) '$($Job.Name)' is on again, but disabled-jobs.json could not be saved: $($_.Exception.Message)" WARN }
 }
 
 function Disable-VeeamManagedJobs {
@@ -5366,8 +5388,8 @@ function Invoke-ExplicitRecovery {
             try {
                 $switched = Enable-VeeamJobById $job
                 if ($job.PSObject.Properties.Name -contains 'Restored') { $job.Restored = $true }
-                Save-DisabledJobState
                 Write-Log $(if ($switched) { "  recovery re-enabled $($job.Family): $($job.Name)" } else { "  recovery: $($job.Family): $($job.Name) is already enabled" })
+                Save-RestoredJobState $job
             }
             catch { $problems += "job '$($job.Name)': $($_.Exception.Message)" }
         }
@@ -7862,8 +7884,8 @@ foreach ($j in $script:DisabledJobs) {
     try {
         $switched = Enable-VeeamJobById $j
         $j.Restored = $true
-        Save-DisabledJobState
         Write-Log $(if ($switched) { "  re-enabled $($j.Family): $($j.Name)" } else { "  $($j.Family): $($j.Name) was never turned off; still enabled" })
+        Save-RestoredJobState $j
     }
     catch { $failedJobs += "$($j.Name) ($($_.Exception.Message))"; Write-Log "  COULD NOT re-enable $($j.Name): $($_.Exception.Message)" ERROR }
 }

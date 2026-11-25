@@ -41,7 +41,7 @@ $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
         'Resolve-PgInstallerLinkFromHtml',
         'Get-VeeamJobFamilyDefinitions','Get-VeeamJobFamilyDefinition',
         'Get-VeeamCoreJob','Get-VeeamCoreJobScheduleFlag','Get-VeeamJobEnabledFlag','Get-VeeamJobScheduleFingerprint','Get-VeeamJobIdentity','Get-VeeamManagedJobInventory',
-        'Invoke-VeeamJobTransition','Get-VeeamJobByRecord','Enable-VeeamJobById','Disable-VeeamManagedJobs','Test-VeeamJobKeptOn',
+        'Invoke-VeeamJobTransition','Get-VeeamJobByRecord','Enable-VeeamJobById','Disable-VeeamManagedJobs','Test-VeeamJobKeptOn','Save-RestoredJobState',
         'Get-ActiveLabelsFromSessions','Get-ActiveVb365OrganizationSyncWork','Get-Vb365QueuedSyncTiming','Write-Vb365StuckSyncOnce','Test-VbrFamilyInUse','Get-BlockingVeeamUiProcesses',
         'Get-ActiveVeeamWork','Wait-VeeamIdle','Find-Vb365MaintenanceBarrier','Start-Vb365MaintenanceBarrier',
         'Get-UnrestoredJobNames',
@@ -1457,6 +1457,30 @@ try {
     Check 'atomic JSON replacement parses' $secondAtomic.Generation 2
     Check 'atomic JSON replaces old content' $secondAtomic.Text 'replacement'
     Check 'atomic writer leaves no temp files' @(Get-ChildItem -LiteralPath $recoveryTemp -Filter 'atomic.json.tmp.*' -Force).Count 0
+    # A file another program holds open for a moment (antivirus, seen on a real server)
+    # is saved once it is let go. One held open for good still fails, and stays as it was.
+    $heldPath = Join-Path $recoveryTemp 'held.json'
+    Write-AtomicText -Path $heldPath -Value 'old'
+    $held = [IO.File]::Open($heldPath, 'Open', 'Read', 'Read')
+    $release = [powershell]::Create().AddScript({ param($Stream) Start-Sleep -Milliseconds 700; $Stream.Dispose() }).AddArgument($held)
+    $releasing = $release.BeginInvoke()
+    Check 'atomic writer: a briefly held file is saved' (Throws { Write-AtomicText -Path $heldPath -Value 'new' }) 'False'
+    [void]$release.EndInvoke($releasing); $release.Dispose()
+    Check 'atomic writer: the new text is there' (Get-Content -LiteralPath $heldPath -Raw).Trim() 'new'
+    $held = [IO.File]::Open($heldPath, 'Open', 'Read', 'Read')
+    try { Check 'atomic writer: a file held for good still fails' (Throws { Write-AtomicText -Path $heldPath -Value 'newer' -Attempts 2 }) 'True' }
+    finally { $held.Dispose() }
+    Check 'atomic writer: a failed save leaves the old text' (Get-Content -LiteralPath $heldPath -Raw).Trim() 'new'
+    Check 'atomic writer: a failed save leaves no temp files' @(Get-ChildItem -LiteralPath $recoveryTemp -Filter 'held.json.tmp.*' -Force).Count 0
+    & {
+        $script:Logged = @()
+        function Write-Log { param($Message, $Level) $script:Logged += "$Level $Message" }
+        function Save-DisabledJobState { throw 'Cannot create a file when that file already exists.' }
+        $onAgain = [pscustomobject]@{ Family = 'VBRProtection'; Name = 'Example Protection Group' }
+        Check 'job back on: a failed save does not fail the job' (Throws { Save-RestoredJobState $onAgain }) 'False'
+        Check 'job back on: a failed save is a warning' (@($script:Logged | Where-Object { $_ -like "WARN*VBRProtection 'Example Protection Group' is on again, but disabled-jobs.json could not be saved*" }).Count) 1
+    }
+    Check 'every re-enable logs before it saves' ([regex]::Matches($scriptText, '(?m)^\s+Write-Log \$\(if \(\$switched\)[^\n]*\n\s+Save-RestoredJobState \$').Count) 4
 
     $script:RunDir = Join-Path $recoveryTemp 'runs\unit-run'
     New-Item -ItemType Directory -Path $script:RunDir -Force | Out-Null

@@ -19,6 +19,13 @@ you change a script, add your entry at the top.
   fix of 2026-10-28.
 * A job that showed as running was logged only as `VBRJob:IsRunning`. The label now names
   the job.
+* A job that was back on could be reported as `JOB_REENABLE_FAILED` (exit `40`). After
+  each job is turned back on, the run saves `disabled-jobs.json`. On a real server,
+  another program (most likely antivirus) still held the file from the save a second
+  before, so the save failed with "Cannot create a file when that file already exists",
+  and the run said it "could not re-enable" a protection group that Veeam had turned on.
+  Every save now tries again for up to about 9 seconds. A save that still fails after a
+  job is back on is a warning, not a failed job.
 
 ### Changed
 
