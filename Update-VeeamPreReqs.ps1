@@ -306,6 +306,7 @@ $script:Report       = [ordered]@{
     UnhealthyServices = ''
     ServicesStarted = ''
     ConsolesClosed = ''
+    ProcessesClosed = ''
     Vb365SyncStuck = ''
     RecoveryRunDir = ''
     Detail         = ''
@@ -346,7 +347,8 @@ function Write-Log {
 function Write-AtomicText {
     param(
         [Parameter(Mandatory)][string] $Path,
-        [Parameter(Mandatory)][AllowEmptyString()][string] $Value
+        [Parameter(Mandatory)][AllowEmptyString()][string] $Value,
+        [ValidateRange(1,20)][int] $Attempts = 10
     )
     $parent = Split-Path -Parent $Path
     if ($parent -and -not (Test-Path -LiteralPath $parent)) {
@@ -355,11 +357,23 @@ function Write-AtomicText {
     $tmp = "$Path.tmp.$PID.$([guid]::NewGuid().ToString('N'))"
     try {
         Set-Content -LiteralPath $tmp -Value $Value -Encoding UTF8 -ErrorAction Stop
-        if (Test-Path -LiteralPath $Path) {
-            try { [IO.File]::Replace($tmp, $Path, $null, $true) }
-            catch { Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop }
-        } else {
-            Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop
+        # Another program, such as antivirus, can hold the file open for a moment after
+        # the last write. Then the swap fails, for example with "Cannot create a file
+        # when that file already exists" (seen on a real server, one second after the
+        # previous save). Try again for up to about 9 seconds before giving up.
+        for ($attempt = 1; $true; $attempt++) {
+            try {
+                if (Test-Path -LiteralPath $Path) {
+                    try { [IO.File]::Replace($tmp, $Path, $null, $true) }
+                    catch { Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop }
+                } else {
+                    Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop
+                }
+                break
+            } catch {
+                if ($attempt -ge $Attempts -or -not (Test-Path -LiteralPath $tmp)) { throw }
+                Start-Sleep -Milliseconds (200 * $attempt)
+            }
         }
     } finally {
         Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
@@ -1879,7 +1893,7 @@ function Invoke-NatsOnlyUpdate {
         $script:ManagedJobInventory = @(Get-VeeamManagedJobInventory -Vbr $hasVbr -Vb365 $hasVb365)
         Disable-VeeamManagedJobs -Inventory $script:ManagedJobInventory
         $inventoryAfterDisable = @(Get-VeeamManagedJobInventory -Vbr $hasVbr -Vb365 $hasVb365)
-        $unexpectedEnabled = @($inventoryAfterDisable | Where-Object { $_.Enabled })
+        $unexpectedEnabled = @($inventoryAfterDisable | Where-Object { $_.Enabled -and -not (Test-VeeamJobKeptOn "$($_.Family)") })
         if ($unexpectedEnabled.Count -gt 0) {
             throw "schedule inventory changed during disable; still enabled: $((@($unexpectedEnabled) | ForEach-Object { "$($_.Family):$($_.Name)" }) -join ', ')"
         }
@@ -1955,7 +1969,7 @@ function Invoke-NatsOnlyUpdate {
 
     try { $finalScheduleInventory = @(Get-VeeamManagedJobInventory -Vbr $hasVbr -Vb365 $hasVb365) }
     catch { Complete-Run $EXIT.PREFLIGHT 'FINAL_JOB_INVENTORY_FAILED' "Could not refresh every schedule immediately before the outage: $($_.Exception.Message)" }
-    $enabledBeforeOutage = @($finalScheduleInventory | Where-Object { $_.Enabled })
+    $enabledBeforeOutage = @($finalScheduleInventory | Where-Object { $_.Enabled -and -not (Test-VeeamJobKeptOn "$($_.Family)") })
     if ($enabledBeforeOutage.Count -gt 0) {
         Complete-Run $EXIT.RETRY 'SCHEDULE_STATE_CHANGED' "Schedules were created or re-enabled before the outage ($((@($enabledBeforeOutage) | ForEach-Object { "$($_.Family):$($_.Name)" }) -join ', ')). The captured schedules will be restored; retry in a controlled window."
     }
@@ -1977,7 +1991,7 @@ function Invoke-NatsOnlyUpdate {
     }
     try { $lastChanceInventory = @(Get-VeeamManagedJobInventory -Vbr $hasVbr -Vb365 $hasVb365) }
     catch { Complete-Run $EXIT.PREFLIGHT 'LAST_CHANCE_JOB_INVENTORY_FAILED' "Could not refresh every schedule before the first service stop: $($_.Exception.Message)" }
-    $lastChanceEnabled = @($lastChanceInventory | Where-Object { $_.Enabled })
+    $lastChanceEnabled = @($lastChanceInventory | Where-Object { $_.Enabled -and -not (Test-VeeamJobKeptOn "$($_.Family)") })
     if ($lastChanceEnabled.Count -gt 0) {
         Complete-Run $EXIT.RETRY 'LAST_CHANCE_SCHEDULE_STATE_CHANGED' "Schedules were created or re-enabled before the first service stop ($(@($lastChanceEnabled | ForEach-Object { "$($_.Family):$($_.Name)" }) -join ', ')). No service was stopped; captured schedules will be restored."
     }
@@ -2274,8 +2288,8 @@ function Invoke-NatsOnlyUpdate {
         try {
             $switched = Enable-VeeamJobById $j
             $j.Restored = $true
-            Save-DisabledJobState
             Write-Log $(if ($switched) { "  re-enabled $($j.Family): $($j.Name)" } else { "  $($j.Family): $($j.Name) was never turned off; still enabled" })
+            Save-RestoredJobState $j
         }
         catch { $failedJobs += "$($j.Name) ($($_.Exception.Message))"; Write-Log "  COULD NOT re-enable $($j.Name): $($_.Exception.Message)" ERROR }
     }
@@ -2477,8 +2491,8 @@ function Invoke-Rollback {
             try {
                 $switched = Enable-VeeamJobById $j
                 if ($j.PSObject.Properties.Name -contains 'Restored') { $j.Restored = $true }
-                Save-DisabledJobState
                 Write-Log $(if ($switched) { "  re-enabled $($j.Family): $($j.Name)" } else { "  $($j.Family): $($j.Name) was never turned off; still enabled" })
+                Save-RestoredJobState $j
             } catch { $problems += "job '$($j.Name)': $($_.Exception.Message)" }
         }
     } else {
@@ -2802,6 +2816,9 @@ function Add-RunSideEffectNotes {
     }
     $closedList = "$($Report['ConsolesClosed'])"
     if ($closedList) { $notes += "This run closed the open Veeam console(s) $closedList; anything unsaved in them was lost." }
+    if ($Report.Contains('ProcessesClosed') -and "$($Report['ProcessesClosed'])") {
+        $notes += "This run closed the Veeam program(s) $($Report['ProcessesClosed']) by force, because they stayed connected to PostgreSQL after every Veeam service had stopped."
+    }
     if ("$($Report['StaleEmRecord'])" -like 'removed*') {
         $notes += 'This run removed the leftover Enterprise Manager registry key; StaleEmRecord names its .reg backup.'
     }
@@ -3589,7 +3606,10 @@ function Get-VeeamJobFamilyDefinitions {
             [pscustomobject]@{ Family='VBRStorageCopy'; Get='Get-VBRStorageCopyJob';          Disable='Disable-VBRStorageCopyJob';          Enable='Enable-VBRStorageCopyJob';          Argument='Job';             Transition='Command';      Required=$false; Enabled=@() },
             [pscustomobject]@{ Family='VBRCDP';         Get='Get-VBRCDPPolicy';               Disable='Disable-VBRCDPPolicy';               Enable='Enable-VBRCDPPolicy';               Argument='Policy';          Transition='Command';      Required=$false; Enabled=@('PolicyState','IsEnabled','Enabled') },
             [pscustomobject]@{ Family='VBRvCDReplica';  Get='Get-VBRvCDReplicaJob';           Disable='Disable-VBRvCDReplicaJob';           Enable='Enable-VBRvCDReplicaJob';           Argument='Job';             Transition='Command';      Required=$false; Enabled=@('ScheduleEnabled','IsScheduleEnabled','IsEnabled') },
-            [pscustomobject]@{ Family='VBRUnstructured';Get='Get-VBRUnstructuredBackupJob';   Disable='Set-VBRNASBackupJob';                Enable='Set-VBRObjectStorageBackupJob';     Argument='Job';             Transition='Unstructured'; Required=$false; Enabled=@('ScheduleEnabled','IsScheduleEnabled') },
+            # File share and object storage jobs: the console's Disable (Disable-VBRJob on
+            # Veeam's CBackupJob), never Set-VBRNASBackupJob -EnableSchedule, which deletes
+            # the schedule. The state is read from CBackupJob too: see Get-VeeamJobEnabledFlag.
+            [pscustomobject]@{ Family='VBRUnstructured';Get='Get-VBRUnstructuredBackupJob';   Disable='Disable-VBRJob';                     Enable='Enable-VBRJob';                     Argument='Job';             Transition='CoreJob';      Required=$false; Enabled=@('CBackupJob.IsScheduleEnabled') },
             [pscustomobject]@{ Family='VBRUnstructuredCopy';Get='Get-VBRUnstructuredBackupCopyJob';Disable='Disable-VBRJob';                 Enable='Enable-VBRJob';                     Argument='Job';             Transition='Command';      Required=$false; Enabled=@('IsScheduleEnabled','ScheduleEnabled','IsEnabled') },
             [pscustomobject]@{ Family='VBREntraTenant'; Get='Get-VBREntraIDTenantBackupJob';  Disable='Set-VBREntraIDTenantBackupJob';      Enable='Set-VBREntraIDTenantBackupJob';      Argument='Job';             Transition='ScheduleSwitch';Required=$false; Enabled=@('EnableSchedule','ScheduleEnabled') },
             [pscustomobject]@{ Family='VBREntraLogs';   Get='Get-VBREntraIDLogsBackupJob';    Disable='Set-VBREntraIDLogsBackupJob';        Enable='Set-VBREntraIDLogsBackupJob';        Argument='Job';             Transition='ScheduleSwitch';Required=$false; Enabled=@('ScheduleEnabled','EnableSchedule') },
@@ -3606,6 +3626,15 @@ function Get-VeeamJobFamilyDefinitions {
     return $defs
 }
 
+# Job families this script never turns off. The configuration backup job stays on, by
+# the operator's choice: the Veeam services are stopped while PostgreSQL is updated, so
+# it cannot run then, and the run makes its own configuration backup in STEP 14. Its
+# definition stays, so a recovery can still switch it on after an older run.
+function Test-VeeamJobKeptOn {
+    param([AllowEmptyString()][string] $Family)
+    return ($Family -in @('VBRConfig'))
+}
+
 function Get-VeeamJobFamilyDefinition {
     param([Parameter(Mandatory)][string] $Family)
     $def = @(Get-VeeamJobFamilyDefinitions -Vbr $true -Vb365 $true | Where-Object { $_.Family -eq $Family })
@@ -3613,25 +3642,38 @@ function Get-VeeamJobFamilyDefinition {
     return $def[0]
 }
 
-# Whether a job is enabled, from Veeam's own CBackupJob (Veeam.Backup.Core). Not a
-# supported API, but Veeam's product management names it as the way to read this for
-# application backup policies. $null when the type or the job cannot be read.
-function Get-VeeamCoreJobScheduleFlag {
+# Veeam's own CBackupJob (Veeam.Backup.Core) for a job ID. Not a supported API, but
+# Veeam's product management names it as the way to read whether an application backup
+# policy is enabled, and Disable-VBRJob and Enable-VBRJob take it. $null when the type
+# or the job cannot be read.
+function Get-VeeamCoreJob {
     param([Parameter(Mandatory)] $Id)
     try {
-        $coreType = 'Veeam.Backup.Core.CBackupJob' -as [type]
-        if (-not $coreType) {
-            # PowerShell 7 resolves type names only in the default load context. A module
-            # that loads Veeam.Backup.Core into its own context still lists it here.
-            $coreType = @([AppDomain]::CurrentDomain.GetAssemblies() | ForEach-Object {
-                try { $_.GetType('Veeam.Backup.Core.CBackupJob', $false) } catch {}
-            } | Where-Object { $_ }) | Select-Object -First 1
-        }
+        $coreType = Resolve-VeeamCoreType 'Veeam.Backup.Core.CBackupJob'
         if (-not $coreType) { return $null }
-        $core = $coreType::Find([guid]"$Id")
-        if ($null -eq $core -or $core.PSObject.Properties.Name -notcontains 'IsScheduleEnabled') { return $null }
-        return [bool]$core.IsScheduleEnabled
+        return $coreType::Find([guid]"$Id")
     } catch { return $null }
+}
+
+# A type from Veeam's own assemblies, or $null. PowerShell 7 resolves type names only
+# in the default load context; a module that loads Veeam.Backup.Core into its own
+# context still lists the assembly here.
+function Resolve-VeeamCoreType {
+    param([Parameter(Mandatory)][string] $Name)
+    $type = $Name -as [type]
+    if ($type) { return $type }
+    return (@([AppDomain]::CurrentDomain.GetAssemblies() | ForEach-Object {
+        try { $_.GetType($Name, $false) } catch {}
+    } | Where-Object { $_ }) | Select-Object -First 1)
+}
+
+# Whether a job is enabled (the console's Disable), from its CBackupJob. $null when it
+# cannot be read.
+function Get-VeeamCoreJobScheduleFlag {
+    param([Parameter(Mandatory)] $Id)
+    $core = Get-VeeamCoreJob -Id $Id
+    if ($null -eq $core -or $core.PSObject.Properties.Name -notcontains 'IsScheduleEnabled') { return $null }
+    return [bool]$core.IsScheduleEnabled
 }
 
 function Get-VeeamJobEnabledFlag {
@@ -3640,10 +3682,13 @@ function Get-VeeamJobEnabledFlag {
     # property: its ScheduleEnabled stays True when the policy is disabled. Checked on
     # VBR 12.3: CBackupJob's IsScheduleEnabled is False after Disable and True after
     # Enable. Without it the state is unknown, so refuse rather than guess.
-    if ("$($Definition.Family)" -eq 'VBRApplication') {
+    # A file share or object storage job is turned off with the console's Disable, which
+    # its ScheduleEnabled does not show: ScheduleEnabled is "Run the job automatically".
+    if ("$($Definition.Family)" -in @('VBRApplication','VBRUnstructured')) {
         $coreFlag = Get-VeeamCoreJobScheduleFlag -Id $Job.Id
         if ($null -eq $coreFlag) {
-            throw [System.NotSupportedException]::new("VBRApplication policy '$($Job.Name)': its PowerShell object has no enabled property, and Veeam's CBackupJob could not be read, so whether it is enabled is unknown")
+            $what = if ("$($Definition.Family)" -eq 'VBRApplication') { "policy '$($Job.Name)': its PowerShell object has no enabled property, and" } else { "job '$($Job.Name)':" }
+            throw [System.NotSupportedException]::new("$($Definition.Family) $what Veeam's CBackupJob could not be read, so whether it is enabled is unknown")
         }
         return $coreFlag
     }
@@ -3654,6 +3699,22 @@ function Get-VeeamJobEnabledFlag {
         }
     }
     throw [System.NotSupportedException]::new("$($Definition.Family) object '$($Job.Name)' exposes none of the expected enabled properties: $($Definition.Enabled -join ', ')")
+}
+
+# A job's schedule as text, to prove that turning the job off and on did not change it.
+# Only file share and object storage jobs have one here: their own Set- commands delete
+# the schedule, so a wrong command must be caught. Other families return ''. A schedule
+# that cannot be read is an error, so the run never changes a job it cannot check.
+function Get-VeeamJobScheduleFingerprint {
+    param([Parameter(Mandatory)] $Job, [Parameter(Mandatory)] $Definition)
+    if ("$($Definition.Family)" -ne 'VBRUnstructured') { return '' }
+    $names = @($Job.PSObject.Properties.Name)
+    if ($names -notcontains 'ScheduleEnabled' -or $names -notcontains 'ScheduleOptions') {
+        throw [System.NotSupportedException]::new("VBRUnstructured job '$($Job.Name)' has no ScheduleEnabled or ScheduleOptions, so its schedule cannot be checked")
+    }
+    try { $options = $Job.ScheduleOptions | ConvertTo-Json -Depth 4 -Compress -WarningAction SilentlyContinue -ErrorAction Stop }
+    catch { throw "VBRUnstructured job '$($Job.Name)': its schedule could not be read: $($_.Exception.Message)" }
+    return "automatic=$([bool]$Job.ScheduleEnabled); $options"
 }
 
 function Get-VeeamJobIdentity {
@@ -3682,9 +3743,6 @@ function Get-VeeamManagedJobInventory {
             continue
         }
         $requiredTransitions = @($def.Disable, $def.Enable)
-        if ($def.Transition -eq 'Unstructured') {
-            $requiredTransitions = @('Set-VBRNASBackupJob','Set-VBRObjectStorageBackupJob')
-        }
         foreach ($needed in $requiredTransitions) {
             if (-not (Get-Command $needed -ErrorAction SilentlyContinue)) {
                 throw [System.NotSupportedException]::new("$($def.Get) is available but $needed is not; $($def.Family) cannot be round-tripped safely")
@@ -3743,17 +3801,18 @@ function Invoke-VeeamJobTransition {
         & $commandName @invokeArgs | Out-Null
         return
     }
-    if ($Definition.Transition -eq 'Unstructured') {
-        $typeName = $Job.GetType().Name
-        if ($typeName -match 'ObjectStorage') { $commandName = 'Set-VBRObjectStorageBackupJob' }
-        elseif ($typeName -match 'NAS|File')  { $commandName = 'Set-VBRNASBackupJob' }
-        else { throw [System.NotSupportedException]::new("Unknown unstructured job subtype '$typeName' for '$($Job.Name)'") }
-        # These Set- commands check the whole job again. A job warning, such as "Potential
-        # data sovereignty violation" when source and target location tags differ, stops
-        # them unless -Force is given. The caller still verifies the new schedule state.
-        $invokeArgs = @{ Job=$Job; EnableSchedule=$enableValue; ErrorAction='Stop'; WarningAction='SilentlyContinue'; WarningVariable='veeamWarnings' }
-        if ((Get-Command $commandName -ErrorAction Stop).Parameters.ContainsKey('Force')) { $invokeArgs['Force'] = $true }
-        & $commandName @invokeArgs | Out-Null
+    if ($Definition.Transition -eq 'CoreJob') {
+        # File share and object storage jobs. Set-VBRNASBackupJob and
+        # Set-VBRObjectStorageBackupJob -EnableSchedule switch "Run the job automatically"
+        # off, which deletes the job's schedule. Disable-VBRJob is the console's Disable:
+        # the job keeps its schedule. It takes the job's CBackupJob. The caller checks the
+        # new state, and that the schedule did not change.
+        $core = Get-VeeamCoreJob -Id $Job.Id
+        if ($null -eq $core) {
+            throw [System.NotSupportedException]::new("$($Definition.Family) '$($Job.Name)': Veeam's CBackupJob could not be read, so it cannot be turned $(if ($enableValue) { 'on' } else { 'off' }) safely")
+        }
+        $commandName = if ($Action -eq 'Disable') { $Definition.Disable } else { $Definition.Enable }
+        & $commandName -Job $core -ErrorAction Stop -WarningAction SilentlyContinue -WarningVariable veeamWarnings | Out-Null
         foreach ($warning in $veeamWarnings) {
             Write-Log "  Veeam warned about $($Definition.Family) '$($Job.Name)': $(Format-ShortText "$warning" 200)"
         }
@@ -3800,6 +3859,14 @@ function Enable-VeeamJobById {
     if (-not (Get-VeeamJobEnabledFlag -Job $verify.Job -Definition $verify.Definition)) {
         throw "$($JobRecord.Family) '$($JobRecord.Name)' is still disabled after Enable"
     }
+    # The job is on. A schedule that is not the same as before is a warning, not a
+    # failure: the job must stay on, and a person has to check the schedule.
+    if ($recordNames -contains 'ScheduleBefore' -and "$($JobRecord.ScheduleBefore)") {
+        $scheduleNow = try { Get-VeeamJobScheduleFingerprint -Job $verify.Job -Definition $verify.Definition } catch { "(unreadable: $($_.Exception.Message))" }
+        if ($scheduleNow -ne "$($JobRecord.ScheduleBefore)") {
+            Write-Log "  $($JobRecord.Family) '$($JobRecord.Name)' is on again, but its schedule is not the same as before this run. Check it in the Veeam console. Before: $(Format-ShortText "$($JobRecord.ScheduleBefore)" 300)" WARN
+        }
+    }
     return $switched
 }
 
@@ -3808,13 +3875,25 @@ function Save-DisabledJobState {
     Write-AtomicJson -Path (Join-Path $script:RunDir 'disabled-jobs.json') -InputObject @($script:DisabledJobs) -Depth 5
 }
 
+# Save the record after a job is back on. The job is on whatever happens here, so a
+# failed save is a warning, never "could not re-enable". A stale record is safe: a
+# recovery only switches a job on again.
+function Save-RestoredJobState {
+    param([Parameter(Mandatory)] $Job)
+    try { Save-DisabledJobState }
+    catch { Write-Log "  $($Job.Family) '$($Job.Name)' is on again, but disabled-jobs.json could not be saved: $($_.Exception.Message)" WARN }
+}
+
 function Disable-VeeamManagedJobs {
     param([Parameter(Mandatory)][AllowEmptyCollection()][object[]] $Inventory)
 
+    foreach ($keptOn in @($Inventory | Where-Object { $_.Enabled -and (Test-VeeamJobKeptOn "$($_.Family)") })) {
+        Write-Log "  left on: $($keptOn.Family): $($keptOn.Name) (this script never turns it off)"
+    }
     # Persist the complete intent before the first mutation. If the process dies
     # between a Veeam call and the following state write, recovery can safely
     # re-enable every object that was known to be enabled on entry.
-    $script:DisabledJobs = @($Inventory | Where-Object { $_.Enabled } | ForEach-Object {
+    $script:DisabledJobs = @($Inventory | Where-Object { $_.Enabled -and -not (Test-VeeamJobKeptOn "$($_.Family)") } | ForEach-Object {
         [pscustomobject][ordered]@{
             Family     = $_.Family
             Id         = $_.Id
@@ -3823,6 +3902,7 @@ function Disable-VeeamManagedJobs {
             DisableAttempted = $false
             Disabled   = $false
             Restored   = $false
+            ScheduleBefore = ''
         }
     })
     Save-DisabledJobState
@@ -3833,6 +3913,8 @@ function Disable-VeeamManagedJobs {
         if (-not (Get-VeeamJobEnabledFlag -Job $found.Job -Definition $found.Definition)) {
             throw "$($record.Family) '$($record.Name)' changed to disabled before this run could disable it; refusing an ambiguous round trip"
         }
+        $scheduleBefore = Get-VeeamJobScheduleFingerprint -Job $found.Job -Definition $found.Definition
+        $record.ScheduleBefore = $scheduleBefore
         # Recorded before the call: from here this run may have turned the job off, so
         # every way back switches it on again, whatever the next check says.
         $record.DisableAttempted = $true
@@ -3841,6 +3923,9 @@ function Disable-VeeamManagedJobs {
         $verify = Get-VeeamJobByRecord $record
         if (Get-VeeamJobEnabledFlag -Job $verify.Job -Definition $verify.Definition) {
             throw "$($record.Family) '$($record.Name)' is still enabled after Disable"
+        }
+        if ((Get-VeeamJobScheduleFingerprint -Job $verify.Job -Definition $verify.Definition) -ne $scheduleBefore) {
+            throw "$($record.Family) '$($record.Name)': its schedule changed when it was turned off. Check its schedule in the Veeam console."
         }
         $record.Disabled = $true
         Save-DisabledJobState
@@ -4298,6 +4383,67 @@ function Get-VeeamConsoleProcesses {
     })
 }
 
+# One PostgreSQL client session as text, for the log and the RMM line.
+function Format-PgClientSummary {
+    param([AllowEmptyCollection()][object[]] $Clients)
+    return (@($Clients | ForEach-Object {
+        "pid=$($_.pid),user=$($_.user),db=$($_.database),app=$($_.application),client=$($_.client),state=$($_.state)"
+    }) -join ' | ')
+}
+
+# Veeam programs that the Veeam services start, and that may be closed by force when
+# they stay connected to PostgreSQL after every Veeam service has stopped. They are
+# not services, so stopping the services does not always close them: seen on a real
+# VBR 12.3 server, with idle sessions. Nothing else is ever closed this way.
+function Get-VeeamPgClientProgramNames { @('Veeam.Backup.Manager','Veeam.Backup.Satellite') }
+
+# The local Veeam program that holds one PostgreSQL session, or $null when it may not
+# be closed. Veeam names each session after its program, version and process ID, for
+# example "Veeam.Backup.Manager.exe(12.3.2.4934):19436". The session must be idle and
+# from this server, the program must be one of Get-VeeamPgClientProgramNames, and a
+# live process with that ID and name must run from a file Veeam has signed.
+function Resolve-VeeamPgClientProcess {
+    param([Parameter(Mandatory)] $Client)
+    if ("$($Client.state)" -ne 'idle') { return $null }
+    if ("$($Client.client)" -notmatch '^(127\.0\.0\.1|::1)(/\d+)?$') { return $null }
+    if (-not ("$($Client.application)" -match '^(?<name>[A-Za-z0-9.]+?)(?:\.exe)?\([^)]*\):(?<pid>\d+)$')) { return $null }
+    $name = $Matches['name']
+    $procId = [int]$Matches['pid']
+    if (@(Get-VeeamPgClientProgramNames) -notcontains $name) { return $null }
+    $found = @(Get-Process -Id $procId -ErrorAction SilentlyContinue | Where-Object { "$($_.ProcessName)" -eq $name })
+    if ($found.Count -ne 1) { return $null }
+    $path = "$($found[0].Path)"
+    if (-not $path) { return $null }
+    try { $signature = Get-AuthenticodeSignature -FilePath $path -ErrorAction Stop } catch { return $null }
+    if ("$($signature.Status)" -ne 'Valid' -or "$($signature.SignerCertificate.Subject)" -notmatch 'Veeam Software') { return $null }
+    return $found[0]
+}
+
+# Close one Veeam program by force. Re-read by ID and name first: a PID can be reused
+# once the program exits, and the process that inherits it must never be touched.
+# Returns $true when the program is gone.
+function Stop-VeeamPgClientProcess {
+    param([Parameter(Mandatory)] $Process, [ValidateRange(1,120)][int] $GraceSeconds = 10)
+    $name = "$($Process.ProcessName)"
+    $procId = [int]$Process.Id
+    $isAlive = { @(Get-Process -Id $procId -ErrorAction SilentlyContinue | Where-Object { "$($_.ProcessName)" -eq $name }).Count -gt 0 }
+    if (-not (& $isAlive)) {
+        Write-Log "  the Veeam program $name PID $procId closed by itself"
+        return $true
+    }
+    $problem = ''
+    try { Stop-Process -Id $procId -Force -ErrorAction Stop } catch { $problem = "$($_.Exception.Message)" }
+    for ($i = 0; $i -lt $GraceSeconds -and (& $isAlive); $i++) { Start-Sleep -Seconds 1 }
+    if (& $isAlive) {
+        $why = if ($problem) { $problem } else { "still running after ${GraceSeconds}s" }
+        Write-Log "Could not close the Veeam program $name PID ${procId}: $why" WARN
+        return $false
+    }
+    Write-Log "Closed the Veeam program $name PID $procId by force. It was still connected to PostgreSQL, with an idle session, after every Veeam service had stopped." WARN
+    Add-ReportListItem -Field 'ProcessesClosed' -Value "${name}:PID$procId"
+    return $true
+}
+
 # True when every blocking label is an open Veeam console. Closing a console only
 # helps then: while a job or an Explorer still blocks, closing it gains nothing and
 # would kill a console an operator reopens to watch that job, every poll.
@@ -4529,6 +4675,69 @@ function Get-SessionsFromGetter {
     }
 }
 
+# Veeam's own list of running backup sessions, CBackupSession::GetRunning(): 0.1 seconds
+# on a real VBR 12.3 server, against 10 minutes for Get-VBRBackupSession. Not a
+# supported API. An array (maybe empty), or $null when it cannot be read.
+function Get-VeeamRunningBackupSessions {
+    $type = Resolve-VeeamCoreType 'Veeam.Backup.Core.CBackupSession'
+    if (-not $type) { return $null }
+    try { return ,@($type::GetRunning()) } catch { return $null }
+}
+
+# A property of a session object as text: the first of the names it has, or '' when it
+# has none. The session lists return different object types, and this script runs in
+# strict mode, where reading a property an object does not have is an error.
+function Get-SessionText {
+    param($Session, [Parameter(Mandatory)][string[]] $Name)
+    foreach ($propertyName in $Name) {
+        if ($null -ne $Session -and $Session.PSObject.Properties.Name -contains $propertyName -and $null -ne $Session.$propertyName) {
+            return "$($Session.$propertyName)"
+        }
+    }
+    return ''
+}
+
+# Session types that GetRunning() returns but Get-VBRBackupSession leaves out, seen on
+# a real VBR 12.3 server: the backup copy policy session, which shows Working while
+# the copy job is on, and system sessions that stay Working for weeks. A type the
+# server's own full list contains is never left out, whatever is listed here.
+function Get-VeeamFastCheckSkippedTypes { @('SimpleBackupCopyPolicy','CheckpointRemoval','TapeLibrariesDiscover') }
+
+# Decide, once per run, whether Veeam's running list can stand in for the full session
+# lists. It can only when it was readable before and after the full lists were read,
+# and held every session they count as running. Types the full lists leave out are left
+# out of later checks too: those named in Get-VeeamFastCheckSkippedTypes, and the type of
+# any session that was running before the full lists were read but is not in them.
+function New-VeeamFastSessionCheck {
+    param([AllowEmptyCollection()][object[]] $FullList = @(), $RunningBefore, $RunningAfter)
+    if ($null -eq $RunningBefore -or $null -eq $RunningAfter) {
+        Write-Log "  Every activity check in this run reads the full session list: Veeam's running-session list (CBackupSession::GetRunning) could not be read." WARN
+        return [pscustomobject]@{ Enabled = $false; SkippedTypes = @() }
+    }
+    # File share and object storage session objects have no JobType, and this script
+    # runs in strict mode, so every property is read through Get-SessionText.
+    $fullTypes = @{}
+    foreach ($session in @($FullList)) { $fullTypes[(Get-SessionText $session 'JobType')] = $true }
+    $runningIds = @{}
+    foreach ($session in @($RunningBefore) + @($RunningAfter)) { $runningIds[(Get-SessionText $session 'Id')] = $true }
+    $missed = @()
+    foreach ($session in @($FullList | Where-Object { (Get-SessionText $_ 'State','Status') -ne 'Stopped' })) {
+        $isActive = @(Get-ActiveLabelsFromSessions -Sessions @($session) -Prefix 'VBR:Backup').Count -gt 0
+        $sessionId = Get-SessionText $session 'Id'
+        if ($isActive -and -not ($sessionId -and $runningIds.ContainsKey($sessionId))) {
+            $missed += "$(Get-SessionText $session 'JobName','Name') ($sessionId)"
+        }
+    }
+    if ($missed.Count -gt 0) {
+        Write-Log "  Every activity check in this run reads the full session list: Veeam's running-session list did not list running session(s) $($missed -join ', ')." WARN
+        return [pscustomobject]@{ Enabled = $false; SkippedTypes = @() }
+    }
+    $skipped = @(@(Get-VeeamFastCheckSkippedTypes) + @(@($RunningBefore) | ForEach-Object { Get-SessionText $_ 'JobType' }) |
+        Where-Object { $_ -and -not $fullTypes.ContainsKey($_) } | Sort-Object -Unique)
+    Write-Log "  Later activity checks in this run use Veeam's running-session list: it held every running session. Session types the full list leaves out stay out: $($skipped -join ', ')."
+    return [pscustomobject]@{ Enabled = $true; SkippedTypes = $skipped }
+}
+
 function Get-ActiveVeeamWork {
     param([bool] $Vbr, [bool] $Vb365)
     $active = @()
@@ -4541,7 +4750,33 @@ function Get-ActiveVeeamWork {
                 throw [System.NotSupportedException]::new("$required has no all-sessions parameter set on this build, so VBR activity cannot be checked safely")
             }
         }
-        $active += @(Get-ActiveLabelsFromSessions -Sessions @(Get-SessionsFromGetter 'Get-VBRBackupSession') -Prefix 'VBR:Backup')
+        # Get-VBRBackupSession reads every session Veeam keeps: 10 minutes for 43,000
+        # sessions on a real VBR 12.3 server, in every check. Veeam's running list takes
+        # 0.1 seconds. The first check of a run reads both and proves the running list
+        # holds every session the full list counts as running; only then do later checks
+        # use the running list alone. See New-VeeamFastSessionCheck.
+        $fastCheck = Get-Variable -Name FastSessionCheck -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+        $calibrate = ($null -eq $fastCheck)
+        $useFast = $false
+        if (-not $calibrate -and $fastCheck.Enabled) {
+            $fastRunning = Get-VeeamRunningBackupSessions
+            if ($null -eq $fastRunning) {
+                $fastCheck.Enabled = $false
+                Write-Log "  Veeam's running-session list could not be read; this and every later check read the full session list" WARN
+            } else {
+                $useFast = $true
+                $kept = @($fastRunning | Where-Object { @($fastCheck.SkippedTypes) -notcontains (Get-SessionText $_ 'JobType') })
+                $active += @(Get-ActiveLabelsFromSessions -Sessions $kept -Prefix 'VBR:Backup')
+            }
+        }
+        $calibrationSessions = @()
+        $runningBefore = $null
+        if (-not $useFast) {
+            if ($calibrate) { $runningBefore = Get-VeeamRunningBackupSessions }
+            $backupSessions = @(Get-SessionsFromGetter 'Get-VBRBackupSession')
+            $active += @(Get-ActiveLabelsFromSessions -Sessions $backupSessions -Prefix 'VBR:Backup')
+            if ($calibrate) { $calibrationSessions += $backupSessions }
+        }
         $active += @(Get-ActiveLabelsFromSessions -Sessions @(Get-SessionsFromGetter 'Get-VBRRestoreSession') -Prefix 'VBR:Restore')
 
         # Protection-group rescans own their deployment work until the discovery
@@ -4592,6 +4827,24 @@ function Get-ActiveVeeamWork {
             $inUse = $false
             if (@($collector.Families).Count -gt 0) { $inUse = Test-VbrFamilyInUse $collector.Families }
             $command = Get-Command $collector.Command -ErrorAction SilentlyContinue
+            # These session lists read every session Veeam keeps, which took minutes on a
+            # real VBR 12.3 server that had none of these jobs: tape 4.4 minutes, agent
+            # 30 seconds. Such a session needs such a job, so skip the list when Veeam
+            # lists no job of that kind. If a job list cannot be read, query as before.
+            $jobListsForSessions = @{
+                'Get-VBRTapeBackupSession'        = @('Get-VBRTapeJob')
+                'Get-VBRComputerBackupJobSession' = @('Get-VBRComputerBackupJob','Get-VBRComputerBackupCopyJob')
+            }
+            if ($command -and $jobListsForSessions.ContainsKey($collector.Command)) {
+                $noSuchJobs = $true
+                foreach ($jobGetter in $jobListsForSessions[$collector.Command]) {
+                    if (-not (Get-Command $jobGetter -ErrorAction SilentlyContinue)) { $noSuchJobs = $false; break }
+                    $listed = $null
+                    try { $listed = @(& $jobGetter -ErrorAction Stop -WarningAction SilentlyContinue) } catch {}
+                    if ($null -eq $listed -or $listed.Count -gt 0) { $noSuchJobs = $false; break }
+                }
+                if ($noSuchJobs) { continue }
+            }
             if ($inUse -and -not $command) {
                 throw [System.NotSupportedException]::new("$($collector.Command) is unavailable for installed family $($collector.Families -join '/')")
             }
@@ -4648,23 +4901,34 @@ function Get-ActiveVeeamWork {
             }
         }
 
-        # Get-VBRUnstructuredBackupSession has no all-sessions parameter set.
-        # Query exact inventory-derived job-name patterns; its -Id parameter is a
-        # session ID and must never be given a job ID.
+        # Get-VBRUnstructuredBackupSession has no all-sessions parameter set, so ask for
+        # every name with -Name '*'; its -Id parameter is a session ID and must never be
+        # given a job ID. One query per job took about 94 seconds each on a real VBR
+        # 12.3 server with 12 such jobs: 19 minutes in every activity check. One query
+        # for '*' returns those sessions and any other, so nothing is missed. These
+        # sessions are in Get-VBRBackupSession too (types NasBackup and NasBackupCopy, the
+        # same 1,875 on that server), so a check that uses the proven running list skips it.
         $unstructuredEntries = @($script:ManagedJobInventory | Where-Object { $_.Family -in @('VBRUnstructured','VBRUnstructuredCopy') })
         if ($unstructuredEntries.Count -gt 0) {
             if (-not (Get-Command Get-VBRUnstructuredBackupSession -ErrorAction SilentlyContinue)) {
                 throw [System.NotSupportedException]::new('Get-VBRUnstructuredBackupSession is unavailable for configured unstructured jobs')
             }
-            $unstructuredSessions = @()
-            foreach ($entry in $unstructuredEntries) {
-                $escapedName = [WildcardPattern]::Escape("$($entry.Name)")
-                $unstructuredSessions += @(Invoke-VeeamEnumeration -Label "Get-VBRUnstructuredBackupSession -Name '$escapedName*'" -Enumerate {
-                    Get-VBRUnstructuredBackupSession -Name "${escapedName}*" -ErrorAction Stop
+            if (-not $useFast) {
+                $unstructuredSessions = @(Invoke-VeeamEnumeration -Label "Get-VBRUnstructuredBackupSession -Name '*'" -Enumerate {
+                    Get-VBRUnstructuredBackupSession -Name '*' -ErrorAction Stop
                 })
+                $unstructuredSessions = @($unstructuredSessions | Sort-Object Id -Unique)
+                $active += @(Get-ActiveLabelsFromSessions -Sessions $unstructuredSessions -Prefix 'VBR:Unstructured')
+                if ($calibrate) { $calibrationSessions += $unstructuredSessions }
             }
-            $unstructuredSessions = @($unstructuredSessions | Sort-Object Id -Unique)
-            $active += @(Get-ActiveLabelsFromSessions -Sessions $unstructuredSessions -Prefix 'VBR:Unstructured')
+            # A second signal that costs nothing: each job's CBackupJob says whether it
+            # runs now. A job whose CBackupJob cannot be read relies on the query above.
+            foreach ($entry in $unstructuredEntries) {
+                $core = Get-VeeamCoreJob -Id $entry.Id
+                if ($core -and $core.PSObject.Properties.Name -contains 'IsRunning' -and $core.IsRunning -eq $true) {
+                    $active += "$($entry.Family):IsRunning:$($entry.Name)"
+                }
+            }
         }
 
         # Newer VBR builds expose an all-session parameter set. Prefer it so
@@ -4757,8 +5021,15 @@ function Get-ActiveVeeamWork {
                 if ($freshJob.PSObject.Properties.Name -notcontains 'IsRunning') {
                     throw [System.NotSupportedException]::new("$($entry.Family) '$($entry.Name)' lost its IsRunning activity property during refresh")
                 }
-                if ($freshJob.IsRunning -eq $true) { $active += "$($entry.Family):IsRunning" }
+                # Name the job, so a long wait says which job holds it.
+                if ($freshJob.IsRunning -eq $true) { $active += "$($entry.Family):IsRunning:$($entry.Name)" }
             }
+        }
+
+        # The full lists were read without error, so this check decides, once per run,
+        # whether later checks may use Veeam's running list instead.
+        if ($calibrate) {
+            Set-Variable -Name FastSessionCheck -Scope Script -Value (New-VeeamFastSessionCheck -FullList $calibrationSessions -RunningBefore $runningBefore -RunningAfter (Get-VeeamRunningBackupSessions))
         }
     }
     if ($Vb365) {
@@ -5222,8 +5493,8 @@ function Invoke-ExplicitRecovery {
             try {
                 $switched = Enable-VeeamJobById $job
                 if ($job.PSObject.Properties.Name -contains 'Restored') { $job.Restored = $true }
-                Save-DisabledJobState
                 Write-Log $(if ($switched) { "  recovery re-enabled $($job.Family): $($job.Name)" } else { "  recovery: $($job.Family): $($job.Name) is already enabled" })
+                Save-RestoredJobState $job
             }
             catch { $problems += "job '$($job.Name)': $($_.Exception.Message)" }
         }
@@ -5611,6 +5882,19 @@ if ($hasEnterpriseManager -and -not $hasVbr) {
 
 if ($hasVbr -and $hasVb365) {
     Complete-Run $EXIT.UNSUPPORTED 'STACKED_VBR_VB365' 'Combined VBR+VB365 servers require a separate certified profile, especially for tuning and recovery. This initial production profile supports one of those products at a time.'
+}
+
+# An -Install run closes every open Veeam console now, at the start, by force if it must.
+# A console is only a client: jobs and restores run in the Veeam services (KB2991). Left
+# open, it holds every later wait for Veeam work. A console opened during the run is
+# closed by the waits, once it is the only thing left. Explorers stay open: they run
+# their own restores. An audit closes nothing.
+if ($Install) {
+    $startConsoles = @(Get-VeeamConsoleProcesses -Vbr $hasVbr -Vb365 $hasVb365)
+    if ($startConsoles.Count -gt 0) {
+        Write-Log "Closing $($startConsoles.Count) open Veeam console(s) at the start of this -Install run." WARN
+        [void](Close-VeeamConsoleProcesses -Vbr $hasVbr -Vb365 $hasVb365)
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -6781,7 +7065,7 @@ try {
     $script:ManagedJobInventory = @(Get-VeeamManagedJobInventory -Vbr $hasVbr -Vb365 $hasVb365)
     Disable-VeeamManagedJobs -Inventory $script:ManagedJobInventory
     $inventoryAfterDisable = @(Get-VeeamManagedJobInventory -Vbr $hasVbr -Vb365 $hasVb365)
-    $unexpectedEnabled = @($inventoryAfterDisable | Where-Object { $_.Enabled })
+    $unexpectedEnabled = @($inventoryAfterDisable | Where-Object { $_.Enabled -and -not (Test-VeeamJobKeptOn "$($_.Family)") })
     if ($unexpectedEnabled.Count -gt 0) {
         throw "schedule inventory changed during disable; still enabled: $((@($unexpectedEnabled) | ForEach-Object { "$($_.Family):$($_.Name)" }) -join ', ')"
     }
@@ -7036,7 +7320,7 @@ try { $finalScheduleInventory = @(Get-VeeamManagedJobInventory -Vbr $hasVbr -Vb3
 catch {
     Complete-Run $EXIT.PREFLIGHT 'FINAL_JOB_INVENTORY_FAILED' "Could not refresh every schedule immediately before the outage: $($_.Exception.Message)"
 }
-$enabledBeforeOutage = @($finalScheduleInventory | Where-Object { $_.Enabled })
+$enabledBeforeOutage = @($finalScheduleInventory | Where-Object { $_.Enabled -and -not (Test-VeeamJobKeptOn "$($_.Family)") })
 if ($enabledBeforeOutage.Count -gt 0) {
     $enabledNames = (@($enabledBeforeOutage) | ForEach-Object { "$($_.Family):$($_.Name)" }) -join ', '
     Complete-Run $EXIT.RETRY 'SCHEDULE_STATE_CHANGED' "Schedules were created or re-enabled during the protected backup phase ($enabledNames). The captured schedules will be restored; retry in a controlled window."
@@ -7095,7 +7379,7 @@ catch {
     $lastInventoryIssue = if ($lastInventoryCode -eq $EXIT.UNSUPPORTED) { 'UNSUPPORTED_SCHEDULER_FAMILY' } else { 'LAST_CHANCE_JOB_INVENTORY_FAILED' }
     Complete-Run $lastInventoryCode $lastInventoryIssue "Could not refresh every schedule after the final drain: $($_.Exception.Message)"
 }
-$lastChanceEnabled = @($lastChanceInventory | Where-Object { $_.Enabled })
+$lastChanceEnabled = @($lastChanceInventory | Where-Object { $_.Enabled -and -not (Test-VeeamJobKeptOn "$($_.Family)") })
 if ($lastChanceEnabled.Count -gt 0) {
     $enabledNames = @($lastChanceEnabled | ForEach-Object { "$($_.Family):$($_.Name)" }) -join ', '
     Complete-Run $EXIT.RETRY 'LAST_CHANCE_SCHEDULE_STATE_CHANGED' "Schedules were created or re-enabled during the final drain ($enabledNames). No service was stopped; captured schedules will be restored and the run must be retried under a change freeze."
@@ -7216,19 +7500,60 @@ FROM pg_stat_activity
 WHERE pid <> pg_backend_pid()
   AND backend_type = 'client backend';
 "@
-$clientActivityResult = Invoke-Psql $clientActivitySql
-if ($clientActivityResult.ExitCode -ne 0 -or -not $clientActivityResult.StdOut) {
-    Complete-Run $EXIT.PREFLIGHT 'PG_CLIENT_ACTIVITY_UNVERIFIED' "Could not verify that PostgreSQL has no remaining client sessions after Veeam stopped. PostgreSQL was NOT stopped. stderr: $($clientActivityResult.StdErr)"
+function Get-RemainingPgClients {
+    $result = Invoke-Psql $clientActivitySql
+    if ($result.ExitCode -ne 0 -or -not $result.StdOut) {
+        Complete-Run $EXIT.PREFLIGHT 'PG_CLIENT_ACTIVITY_UNVERIFIED' "Could not verify that PostgreSQL has no remaining client sessions after Veeam stopped. PostgreSQL was NOT stopped. stderr: $($result.StdErr)"
+    }
+    try { return @(ConvertFrom-JsonArrayText $result.StdOut) }
+    catch {
+        Complete-Run $EXIT.PREFLIGHT 'PG_CLIENT_ACTIVITY_UNVERIFIED' "PostgreSQL client-session inventory was not valid JSON. PostgreSQL was NOT stopped: $($_.Exception.Message)"
+    }
 }
-try { $remainingPgClients = @(ConvertFrom-JsonArrayText $clientActivityResult.StdOut) }
-catch {
-    Complete-Run $EXIT.PREFLIGHT 'PG_CLIENT_ACTIVITY_UNVERIFIED' "PostgreSQL client-session inventory was not valid JSON. PostgreSQL was NOT stopped: $($_.Exception.Message)"
+
+# A Veeam program can take a while to close after its service stops. Wait for it.
+$pgClientWaitSeconds = 300
+$pgClientTimer = [Diagnostics.Stopwatch]::StartNew()
+$pgClientsLogged = ''
+while ($true) {
+    $remainingPgClients = @(Get-RemainingPgClients)
+    if ($remainingPgClients.Count -eq 0 -or $pgClientTimer.Elapsed.TotalSeconds -ge $pgClientWaitSeconds) { break }
+    $clientSummary = Format-PgClientSummary $remainingPgClients
+    if ($clientSummary -ne $pgClientsLogged) {
+        Write-Log "Waiting up to $([int]($pgClientWaitSeconds / 60)) minutes for PostgreSQL client session(s) to close after Veeam stopped: $clientSummary" WARN
+        $pgClientsLogged = $clientSummary
+    }
+    Start-Sleep -Seconds 10
 }
+
 if ($remainingPgClients.Count -gt 0) {
-    $clientSummary = @($remainingPgClients | ForEach-Object {
-        "pid=$($_.pid),user=$($_.user),db=$($_.database),app=$($_.application),client=$($_.client),state=$($_.state)"
-    }) -join ' | '
-    Complete-Run $EXIT.RETRY 'PG_CLIENTS_STILL_CONNECTED' "PostgreSQL still has untracked client connection(s) after Veeam stopped ($clientSummary). They were not terminated; close or coordinate them, then retry."
+    $clientSummary = Format-PgClientSummary $remainingPgClients
+    # Close by force only when every remaining session belongs to a Veeam program
+    # that may be closed, and every Veeam service is still stopped. Anything else
+    # (an operator, a monitor, pgAdmin) is never closed: the run stops instead.
+    $closableProcesses = @()
+    $otherClients = @()
+    foreach ($pgClient in $remainingPgClients) {
+        $veeamProcess = Resolve-VeeamPgClientProcess -Client $pgClient
+        if ($veeamProcess) { $closableProcesses += $veeamProcess } else { $otherClients += $pgClient }
+    }
+    $veeamRunningAgain = @(Get-Service -Name 'Veeam*' -ErrorAction SilentlyContinue | Where-Object { $_.Status -ne 'Stopped' })
+    if ($otherClients.Count -gt 0 -or $veeamRunningAgain.Count -gt 0) {
+        $whyNotClosed = if ($veeamRunningAgain.Count -gt 0) { 'a Veeam service is running again' } else { "not every session is an idle Veeam program this script may close ($(Format-PgClientSummary $otherClients))" }
+        Complete-Run $EXIT.RETRY 'PG_CLIENTS_STILL_CONNECTED' "PostgreSQL still has client connection(s) $([int]($pgClientWaitSeconds / 60)) minutes after Veeam stopped ($clientSummary). They were not closed, because $whyNotClosed. Close or coordinate them, then retry."
+    }
+    foreach ($veeamProcess in @($closableProcesses | Sort-Object Id -Unique)) {
+        [void](Stop-VeeamPgClientProcess -Process $veeamProcess)
+    }
+    # PostgreSQL ends a session as soon as its program exits. Allow a little time.
+    for ($i = 0; $i -lt 15; $i++) {
+        $remainingPgClients = @(Get-RemainingPgClients)
+        if ($remainingPgClients.Count -eq 0) { break }
+        Start-Sleep -Seconds 2
+    }
+    if ($remainingPgClients.Count -gt 0) {
+        Complete-Run $EXIT.RETRY 'PG_CLIENTS_STILL_CONNECTED' "PostgreSQL still has client connection(s) after Veeam stopped and its leftover programs were closed ($(Format-PgClientSummary $remainingPgClients)). They were not terminated; close or coordinate them, then retry."
+    }
 }
 Write-Log 'No other PostgreSQL client sessions remain after Veeam stopped' OK
 
@@ -7664,8 +7989,8 @@ foreach ($j in $script:DisabledJobs) {
     try {
         $switched = Enable-VeeamJobById $j
         $j.Restored = $true
-        Save-DisabledJobState
         Write-Log $(if ($switched) { "  re-enabled $($j.Family): $($j.Name)" } else { "  $($j.Family): $($j.Name) was never turned off; still enabled" })
+        Save-RestoredJobState $j
     }
     catch { $failedJobs += "$($j.Name) ($($_.Exception.Message))"; Write-Log "  COULD NOT re-enable $($j.Name): $($_.Exception.Message)" ERROR }
 }

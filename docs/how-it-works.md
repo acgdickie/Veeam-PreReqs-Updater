@@ -65,7 +65,7 @@ the RMM summary. See [Exit codes](exit-codes.md) and [If it goes wrong](troubles
 |---|---|---|
 | STEP 1 - Load settings | Loads the settings built into the script, then purges logs and completed run folders older than `retentionDays`. It keeps unresolved runs and the two newest completed recovery sets. | Settings come only from the reviewed script. Without the purge, daily audits would fill the disk. |
 | STEP 2 - Context checks | Checks the switch combination, that the server runs Windows and is not a Veeam appliance, that the run is elevated, and that `-Install` is not over PowerShell remoting. Acts on a changes-in-progress marker (see below). | Each of these breaks an unattended update. An interrupted run must be dealt with before a new one starts. |
-| STEP 3 - Detect Veeam products | Finds VBR, VB365, Veeam ONE and Enterprise Manager, and leftover registry keys (see below). Warns about Veeam services set to start automatically that are stopped. Refuses topologies outside the supported profile. | Decides which product profile applies, and stops early on a server the script does not support. |
+| STEP 3 - Detect Veeam products | Finds VBR, VB365, Veeam ONE and Enterprise Manager, and leftover registry keys (see below). Warns about Veeam services set to start automatically that are stopped. Refuses topologies outside the supported profile. An `-Install` run then closes every open Veeam console. | Decides which product profile applies, and stops early on a server the script does not support. An open console would hold every later wait for Veeam work. |
 | STEP 4 - Confirm database engine | Reads where each product keeps its database: VBR's active engine and connection from the registry, Enterprise Manager's database the same way, and VB365's `Config.xml` and `Proxy.xml`. All must be local PostgreSQL on one port. | Nothing is guessed. A remote database or two ports means the script cannot tell what it is updating. |
 | STEP 5 - Detect PostgreSQL installation | Requires exactly one PostgreSQL installation in the registry and one PostgreSQL Windows service, which must run `pg_ctl.exe` or `postgres.exe` from that installation. Checks that `psql`, `pg_dump`, `pg_dumpall` and `pg_restore` are there. | The installer must patch the instance Veeam really uses, and the backup tools must exist. |
 | STEP 6 - Read running server version | Requires PostgreSQL to be running, logs in, and reads the running version. Checks the instance in several ways (see below). | Proves the instance is the right one, standalone, and reachable, before anything else. |
@@ -135,6 +135,15 @@ the RMM summary. See [Exit codes](exit-codes.md) and [If it goes wrong](troubles
 
 #### STEP 13 detail
 
+The configuration backup job is never turned off. The Veeam services are stopped while
+PostgreSQL is updated, so it cannot run then, and the run makes its own configuration
+backup in STEP 14. The log says "left on" for it.
+
+File share and object storage backup jobs are turned off with the console's Disable
+(`Disable-VBRJob`), so each job keeps its schedule. The script reads the schedule before
+and after. If turning a job off changes its schedule, the run stops and rolls back. If the
+schedule is not the same when the job is back on, the log says so.
+
 After the jobs are disabled:
 
 1. Waits again for work that started in the meantime.
@@ -151,7 +160,9 @@ After the jobs are disabled:
 
 After the services and NATS are stopped:
 
-1. Checks nothing else is connected to PostgreSQL.
+1. Checks nothing else is connected to PostgreSQL. It waits up to 5 minutes for
+   connections to close, and can close a leftover Veeam program (see
+   [Other PostgreSQL clients](#other-postgresql-clients)).
 2. Dumps any cache database VB365 created meanwhile.
 3. Stops PostgreSQL.
 
@@ -303,8 +314,9 @@ But only an external change freeze closes the remote manual-start race completel
 An open console is not waited for. The VBR console (`Veeam.Backup.Shell`) and the VB365
 console (`Veeam.Archiver.Shell`) are clients only.
 
-- **When:** `-Install` and `-Recover` close them once a console is the only thing left
-  blocking. While a job still runs, the console is left alone.
+- **When:** an `-Install` run closes every open console at the start, in STEP 3. Later,
+  `-Install` and `-Recover` close a console once it is the only thing left blocking. While
+  a job still runs, a console opened during the run is left alone.
 - **How:** the script asks first, then forces. Run from an RMM as SYSTEM, the forced close
   is the normal path.
 - **Unsaved work:** anything unsaved in that console is lost.
@@ -401,7 +413,18 @@ startup type is still restored.
 After Veeam is stopped, the script queries `pg_stat_activity`. It refuses to stop
 PostgreSQL while any other client session remains.
 
-- **Result:** it reports exit `10` and the client details for the RMM.
-- **Never kills:** it never terminates those sessions.
+- **Wait:** it checks every 10 seconds, for up to 5 minutes. A Veeam program can take a
+  while to close after its service stops.
+- **Leftover Veeam programs:** `Veeam.Backup.Manager.exe` and `Veeam.Backup.Satellite.exe`
+  are started by the Veeam services but are not services, so they can stay connected.
+  After the wait, the script closes them by force, only when all of this is true:
+  - every remaining session belongs to one of these two programs;
+  - each session is idle and comes from this server;
+  - the program runs from a file signed by Veeam;
+  - every Veeam service is still stopped.
+
+  `ProcessesClosed` names each program it closed.
+- **Anything else:** an operator, a monitor or pgAdmin is never closed. The run reports
+  exit `10` and the client details for the RMM, and puts everything back.
 
 [Back to the README](../README.md) · [All docs](README.md)

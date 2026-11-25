@@ -5,6 +5,62 @@ All notable changes, newest first. The format follows
 numbers, so each entry is the date the change reached GitHub, with its commit IDs. When
 you change a script, add your entry at the top.
 
+## 2026-11-25
+
+### Fixed
+
+* File share and object storage backup jobs lost their schedule. The script turned them
+  off with `Set-VBRNASBackupJob` or `Set-VBRObjectStorageBackupJob -EnableSchedule`, which
+  switches "Run the job automatically" off and deletes the schedule. They are now turned
+  off and on with the console's Disable (`Disable-VBRJob` and `Enable-VBRJob` on the job's
+  `CBackupJob`), and their state is read from `CBackupJob` too. The run saves each job's
+  schedule first. If turning a job off changes it, the run stops and rolls back, and if it
+  is not the same when the job is back on, the log says so. This replaces the `-Force`
+  fix of 2026-10-28.
+* A job that showed as running was logged only as `VBRJob:IsRunning`. The label now names
+  the job.
+* A job that was back on could be reported as `JOB_REENABLE_FAILED` (exit `40`). After
+  each job is turned back on, the run saves `disabled-jobs.json`. On a real server,
+  another program (most likely antivirus) still held the file from the save a second
+  before, so the save failed with "Cannot create a file when that file already exists",
+  and the run said it "could not re-enable" a protection group that Veeam had turned on.
+  Every save now tries again for up to about 9 seconds. A save that still fails after a
+  job is back on is a warning, not a failed job.
+
+### Changed
+
+* Faster activity checks. On a real VBR 12.3 server, each check took about 35 minutes,
+  and a run makes about 7 of them. File share and object storage sessions are now read
+  with one query for every name (`Get-VBRUnstructuredBackupSession -Name '*'`), not one
+  per job: each per-job query took about 94 seconds, so 19 minutes with 12 jobs. Each
+  such job's `CBackupJob` is also asked whether it runs now. The tape session list is
+  skipped when Veeam lists no tape jobs (4.4 minutes on a server with none), and the
+  agent session list when it lists no agent jobs (30 seconds).
+* After the first check of a run, the activity checks use Veeam's own list of running
+  sessions (`CBackupSession::GetRunning()`, 0.1 seconds) instead of every session Veeam
+  keeps (`Get-VBRBackupSession`, 10 minutes for 43,000 sessions) and the file share
+  query. The first check reads both and uses the fast list only if it held every
+  running session; if not, or if it cannot be read, every check reads the full lists
+  as before. Session types the full list leaves out stay out, so stuck system sessions
+  and the backup copy policy session never hold a run. On that server, with 26 schedule
+  objects, a whole `-Install` now takes about 31 minutes, and the jobs are off for about
+  18 minutes instead of more than 3 hours.
+* A Veeam program that stays connected to PostgreSQL after every Veeam service has
+  stopped no longer stops the run straight away (`PG_CLIENTS_STILL_CONNECTED`, exit
+  `10`). Seen on a real VBR 12.3 server: `Veeam.Backup.Manager.exe` and
+  `Veeam.Backup.Satellite.exe` kept idle sessions open. The run now waits up to 5
+  minutes for the sessions to close. Then it closes those two programs by force, only
+  when every remaining session is theirs, idle and local, the file is signed by Veeam,
+  and every Veeam service is still stopped. Any other client still stops the run, as
+  before. New report field `ProcessesClosed`.
+* The configuration backup job is no longer turned off. The Veeam services are stopped
+  while PostgreSQL is updated, so it cannot run then, and the run makes its own
+  configuration backup in STEP 14. A recovery of an older run still switches it back on.
+* An `-Install` run closes every open Veeam console at the start (STEP 3), by force if it
+  must. Before, it closed a console only when the console was the only thing left
+  blocking. That rule still applies to a console opened later in the run. An audit still
+  closes nothing.
+
 ## 2026-10-28
 
 ### Fixed
