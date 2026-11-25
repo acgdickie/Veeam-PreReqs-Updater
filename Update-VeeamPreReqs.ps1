@@ -3649,17 +3649,22 @@ function Get-VeeamJobFamilyDefinition {
 function Get-VeeamCoreJob {
     param([Parameter(Mandatory)] $Id)
     try {
-        $coreType = 'Veeam.Backup.Core.CBackupJob' -as [type]
-        if (-not $coreType) {
-            # PowerShell 7 resolves type names only in the default load context. A module
-            # that loads Veeam.Backup.Core into its own context still lists it here.
-            $coreType = @([AppDomain]::CurrentDomain.GetAssemblies() | ForEach-Object {
-                try { $_.GetType('Veeam.Backup.Core.CBackupJob', $false) } catch {}
-            } | Where-Object { $_ }) | Select-Object -First 1
-        }
+        $coreType = Resolve-VeeamCoreType 'Veeam.Backup.Core.CBackupJob'
         if (-not $coreType) { return $null }
         return $coreType::Find([guid]"$Id")
     } catch { return $null }
+}
+
+# A type from Veeam's own assemblies, or $null. PowerShell 7 resolves type names only
+# in the default load context; a module that loads Veeam.Backup.Core into its own
+# context still lists the assembly here.
+function Resolve-VeeamCoreType {
+    param([Parameter(Mandatory)][string] $Name)
+    $type = $Name -as [type]
+    if ($type) { return $type }
+    return (@([AppDomain]::CurrentDomain.GetAssemblies() | ForEach-Object {
+        try { $_.GetType($Name, $false) } catch {}
+    } | Where-Object { $_ }) | Select-Object -First 1)
 }
 
 # Whether a job is enabled (the console's Disable), from its CBackupJob. $null when it
@@ -4670,6 +4675,51 @@ function Get-SessionsFromGetter {
     }
 }
 
+# Veeam's own list of running backup sessions, CBackupSession::GetRunning(): 0.1 seconds
+# on a real VBR 12.3 server, against 10 minutes for Get-VBRBackupSession. Not a
+# supported API. An array (maybe empty), or $null when it cannot be read.
+function Get-VeeamRunningBackupSessions {
+    $type = Resolve-VeeamCoreType 'Veeam.Backup.Core.CBackupSession'
+    if (-not $type) { return $null }
+    try { return ,@($type::GetRunning()) } catch { return $null }
+}
+
+# Session types that GetRunning() returns but Get-VBRBackupSession leaves out, seen on
+# a real VBR 12.3 server: the backup copy policy session, which shows Working while
+# the copy job is on, and system sessions that stay Working for weeks. A type the
+# server's own full list contains is never left out, whatever is listed here.
+function Get-VeeamFastCheckSkippedTypes { @('SimpleBackupCopyPolicy','CheckpointRemoval','TapeLibrariesDiscover') }
+
+# Decide, once per run, whether Veeam's running list can stand in for the full session
+# lists. It can only when it was readable before and after the full lists were read,
+# and held every session they count as running. Types the full lists leave out are left
+# out of later checks too: those named in Get-VeeamFastCheckSkippedTypes, and the type of
+# any session that was running before the full lists were read but is not in them.
+function New-VeeamFastSessionCheck {
+    param([AllowEmptyCollection()][object[]] $FullList = @(), $RunningBefore, $RunningAfter)
+    if ($null -eq $RunningBefore -or $null -eq $RunningAfter) {
+        Write-Log "  Every activity check in this run reads the full session list: Veeam's running-session list (CBackupSession::GetRunning) could not be read." WARN
+        return [pscustomobject]@{ Enabled = $false; SkippedTypes = @() }
+    }
+    $fullTypes = @{}
+    foreach ($session in @($FullList)) { $fullTypes["$($session.JobType)"] = $true }
+    $runningIds = @{}
+    foreach ($session in @($RunningBefore) + @($RunningAfter)) { $runningIds["$($session.Id)"] = $true }
+    $missed = @()
+    foreach ($session in @($FullList | Where-Object { "$($_.State)" -ne 'Stopped' })) {
+        $isActive = @(Get-ActiveLabelsFromSessions -Sessions @($session) -Prefix 'VBR:Backup').Count -gt 0
+        if ($isActive -and -not $runningIds.ContainsKey("$($session.Id)")) { $missed += "$($session.JobName) ($($session.Id))" }
+    }
+    if ($missed.Count -gt 0) {
+        Write-Log "  Every activity check in this run reads the full session list: Veeam's running-session list did not list running session(s) $($missed -join ', ')." WARN
+        return [pscustomobject]@{ Enabled = $false; SkippedTypes = @() }
+    }
+    $skipped = @(@(Get-VeeamFastCheckSkippedTypes) + @(@($RunningBefore) | ForEach-Object { "$($_.JobType)" }) |
+        Where-Object { $_ -and -not $fullTypes.ContainsKey($_) } | Sort-Object -Unique)
+    Write-Log "  Later activity checks in this run use Veeam's running-session list: it held every running session. Session types the full list leaves out stay out: $($skipped -join ', ')."
+    return [pscustomobject]@{ Enabled = $true; SkippedTypes = $skipped }
+}
+
 function Get-ActiveVeeamWork {
     param([bool] $Vbr, [bool] $Vb365)
     $active = @()
@@ -4682,7 +4732,33 @@ function Get-ActiveVeeamWork {
                 throw [System.NotSupportedException]::new("$required has no all-sessions parameter set on this build, so VBR activity cannot be checked safely")
             }
         }
-        $active += @(Get-ActiveLabelsFromSessions -Sessions @(Get-SessionsFromGetter 'Get-VBRBackupSession') -Prefix 'VBR:Backup')
+        # Get-VBRBackupSession reads every session Veeam keeps: 10 minutes for 43,000
+        # sessions on a real VBR 12.3 server, in every check. Veeam's running list takes
+        # 0.1 seconds. The first check of a run reads both and proves the running list
+        # holds every session the full list counts as running; only then do later checks
+        # use the running list alone. See New-VeeamFastSessionCheck.
+        $fastCheck = Get-Variable -Name FastSessionCheck -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+        $calibrate = ($null -eq $fastCheck)
+        $useFast = $false
+        if (-not $calibrate -and $fastCheck.Enabled) {
+            $fastRunning = Get-VeeamRunningBackupSessions
+            if ($null -eq $fastRunning) {
+                $fastCheck.Enabled = $false
+                Write-Log "  Veeam's running-session list could not be read; this and every later check read the full session list" WARN
+            } else {
+                $useFast = $true
+                $kept = @($fastRunning | Where-Object { @($fastCheck.SkippedTypes) -notcontains "$($_.JobType)" })
+                $active += @(Get-ActiveLabelsFromSessions -Sessions $kept -Prefix 'VBR:Backup')
+            }
+        }
+        $calibrationSessions = @()
+        $runningBefore = $null
+        if (-not $useFast) {
+            if ($calibrate) { $runningBefore = Get-VeeamRunningBackupSessions }
+            $backupSessions = @(Get-SessionsFromGetter 'Get-VBRBackupSession')
+            $active += @(Get-ActiveLabelsFromSessions -Sessions $backupSessions -Prefix 'VBR:Backup')
+            if ($calibrate) { $calibrationSessions += $backupSessions }
+        }
         $active += @(Get-ActiveLabelsFromSessions -Sessions @(Get-SessionsFromGetter 'Get-VBRRestoreSession') -Prefix 'VBR:Restore')
 
         # Protection-group rescans own their deployment work until the discovery
@@ -4811,17 +4887,22 @@ function Get-ActiveVeeamWork {
         # every name with -Name '*'; its -Id parameter is a session ID and must never be
         # given a job ID. One query per job took about 94 seconds each on a real VBR
         # 12.3 server with 12 such jobs: 19 minutes in every activity check. One query
-        # for '*' returns those sessions and any other, so nothing is missed.
+        # for '*' returns those sessions and any other, so nothing is missed. These
+        # sessions are in Get-VBRBackupSession too (types NasBackup and NasBackupCopy, the
+        # same 1,875 on that server), so a check that uses the proven running list skips it.
         $unstructuredEntries = @($script:ManagedJobInventory | Where-Object { $_.Family -in @('VBRUnstructured','VBRUnstructuredCopy') })
         if ($unstructuredEntries.Count -gt 0) {
             if (-not (Get-Command Get-VBRUnstructuredBackupSession -ErrorAction SilentlyContinue)) {
                 throw [System.NotSupportedException]::new('Get-VBRUnstructuredBackupSession is unavailable for configured unstructured jobs')
             }
-            $unstructuredSessions = @(Invoke-VeeamEnumeration -Label "Get-VBRUnstructuredBackupSession -Name '*'" -Enumerate {
-                Get-VBRUnstructuredBackupSession -Name '*' -ErrorAction Stop
-            })
-            $unstructuredSessions = @($unstructuredSessions | Sort-Object Id -Unique)
-            $active += @(Get-ActiveLabelsFromSessions -Sessions $unstructuredSessions -Prefix 'VBR:Unstructured')
+            if (-not $useFast) {
+                $unstructuredSessions = @(Invoke-VeeamEnumeration -Label "Get-VBRUnstructuredBackupSession -Name '*'" -Enumerate {
+                    Get-VBRUnstructuredBackupSession -Name '*' -ErrorAction Stop
+                })
+                $unstructuredSessions = @($unstructuredSessions | Sort-Object Id -Unique)
+                $active += @(Get-ActiveLabelsFromSessions -Sessions $unstructuredSessions -Prefix 'VBR:Unstructured')
+                if ($calibrate) { $calibrationSessions += $unstructuredSessions }
+            }
             # A second signal that costs nothing: each job's CBackupJob says whether it
             # runs now. A job whose CBackupJob cannot be read relies on the query above.
             foreach ($entry in $unstructuredEntries) {
@@ -4925,6 +5006,12 @@ function Get-ActiveVeeamWork {
                 # Name the job, so a long wait says which job holds it.
                 if ($freshJob.IsRunning -eq $true) { $active += "$($entry.Family):IsRunning:$($entry.Name)" }
             }
+        }
+
+        # The full lists were read without error, so this check decides, once per run,
+        # whether later checks may use Veeam's running list instead.
+        if ($calibrate) {
+            Set-Variable -Name FastSessionCheck -Scope Script -Value (New-VeeamFastSessionCheck -FullList $calibrationSessions -RunningBefore $runningBefore -RunningAfter (Get-VeeamRunningBackupSessions))
         }
     }
     if ($Vb365) {

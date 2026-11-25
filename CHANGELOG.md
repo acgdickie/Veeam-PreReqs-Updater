@@ -36,6 +36,13 @@ you change a script, add your entry at the top.
   such job's `CBackupJob` is also asked whether it runs now. The tape session list is
   skipped when Veeam lists no tape jobs (4.4 minutes on a server with none), and the
   agent session list when it lists no agent jobs (30 seconds).
+* After the first check of a run, the activity checks use Veeam's own list of running
+  sessions (`CBackupSession::GetRunning()`, 0.1 seconds) instead of every session Veeam
+  keeps (`Get-VBRBackupSession`, 10 minutes for 43,000 sessions) and the file share
+  query. The first check reads both and uses the fast list only if it held every
+  running session; if not, or if it cannot be read, every check reads the full lists
+  as before. Session types the full list leaves out stay out, so stuck system sessions
+  and the backup copy policy session never hold a run.
 * A Veeam program that stays connected to PostgreSQL after every Veeam service has
   stopped no longer stops the run straight away (`PG_CLIENTS_STILL_CONNECTED`, exit
   `10`). Seen on a real VBR 12.3 server: `Veeam.Backup.Manager.exe` and

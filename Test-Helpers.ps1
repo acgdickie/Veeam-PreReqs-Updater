@@ -40,7 +40,7 @@ $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
         'Get-PolicyExitCode','Get-RmmActionForExitCode','Invoke-DelayedReboot',
         'Resolve-PgInstallerLinkFromHtml',
         'Get-VeeamJobFamilyDefinitions','Get-VeeamJobFamilyDefinition',
-        'Get-VeeamCoreJob','Get-VeeamCoreJobScheduleFlag','Get-VeeamJobEnabledFlag','Get-VeeamJobScheduleFingerprint','Get-VeeamJobIdentity','Get-VeeamManagedJobInventory',
+        'Get-VeeamCoreJob','Resolve-VeeamCoreType','Get-VeeamRunningBackupSessions','Get-VeeamFastCheckSkippedTypes','New-VeeamFastSessionCheck','Get-VeeamCoreJobScheduleFlag','Get-VeeamJobEnabledFlag','Get-VeeamJobScheduleFingerprint','Get-VeeamJobIdentity','Get-VeeamManagedJobInventory',
         'Invoke-VeeamJobTransition','Get-VeeamJobByRecord','Enable-VeeamJobById','Disable-VeeamManagedJobs','Test-VeeamJobKeptOn','Save-RestoredJobState',
         'Get-ActiveLabelsFromSessions','Get-ActiveVb365OrganizationSyncWork','Get-Vb365QueuedSyncTiming','Write-Vb365StuckSyncOnce','Test-VbrFamilyInUse','Get-BlockingVeeamUiProcesses',
         'Get-ActiveVeeamWork','Wait-VeeamIdle','Find-Vb365MaintenanceBarrier','Start-Vb365MaintenanceBarrier',
@@ -67,6 +67,9 @@ function Write-Log { param($Message, $Level) }   # stub
 # No Veeam here, so -Recover's module check would always fail. Recovery tests that need
 # it to fail define their own; the real function is tested on its own below.
 function Test-VeeamModuleImport { param([switch] $Vbr, [switch] $Vb365) @() }   # stub
+# No Veeam here: Veeam's running-session list cannot be read, so every activity check
+# reads the full lists. The fast-check tests define their own.
+function Get-VeeamRunningBackupSessions { $null }   # stub
 
 # The shipping script waits up to 10 minutes for Veeam services to settle, because
 # VBR 13's Backup Service can genuinely take minutes. Tests use fakes that never
@@ -971,7 +974,67 @@ $script:ManagedJobInventory = @()
     Check 'unstructured sessions: a stopped job does not' (@($w | Where-Object { $_ -like '*Copy)' }).Count) 0
     $script:ManagedJobInventory = @()
 }
+# The fast session check: the first check of a run reads the full lists and proves
+# Veeam's running list against them; later checks use the running list alone.
+& {
+    function New-Sess { param([string] $Id, [string] $State, [string] $Type = 'Backup', [string] $Job = 'Example Backup Job')
+        [pscustomobject]@{ Id = $Id; State = $State; JobType = $Type; JobName = $Job } }
+    $script:FullCalls = 0
+    $script:FakeFull = @((New-Sess 'old-1' 'Stopped'), (New-Sess 'run-1' 'Working'), (New-Sess 'nas-old' 'Stopped' 'NasBackup'))
+    $script:FakeRunning = @((New-Sess 'run-1' 'Working'), (New-Sess 'pol-1' 'Working' 'SimpleBackupCopyPolicy'), (New-Sess 'sys-1' 'Working' 'CheckpointRemoval'), (New-Sess 'odd-1' 'Working' 'SomeSystemJob'))
+    function Get-VBRBackupSession { [CmdletBinding()] param() $script:FullCalls++; $script:FakeFull }
+    function Get-VeeamRunningBackupSessions { if ($null -eq $script:FakeRunning) { return $null }; return ,@($script:FakeRunning) }
+    function Get-FastCheck { Get-Variable -Name FastSessionCheck -Scope Script -ValueOnly }
+    Set-Variable -Name FastSessionCheck -Scope Script -Value $null
+    $w = @(Get-ActiveVeeamWork -Vbr $true -Vb365 $false)
+    Check 'fast check: the first check reads the full list'           "$script:FullCalls $(@($w | Where-Object { $_ -like 'VBR:Backup*' }).Count)" '1 1'
+    Check 'fast check: proven when it holds every running session'    (Get-FastCheck).Enabled 'True'
+    Check 'fast check: types the full list leaves out stay out'       (@((Get-FastCheck).SkippedTypes) -join ',') 'CheckpointRemoval,SimpleBackupCopyPolicy,SomeSystemJob,TapeLibrariesDiscover'
+    $w = @(Get-ActiveVeeamWork -Vbr $true -Vb365 $false)
+    Check 'fast check: a later check does not read the full list'     $script:FullCalls 1
+    Check 'fast check: it still finds the running backup, and only it' (@($w | Where-Object { $_ -like 'VBR:Backup*' }) -join ',') 'VBR:Backup:Working'
+    $script:FakeRunning = @((New-Sess 'pol-1' 'Working' 'SimpleBackupCopyPolicy'))
+    Check 'fast check: a copy policy session alone holds nothing'     @(@(Get-ActiveVeeamWork -Vbr $true -Vb365 $false) | Where-Object { $_ -like 'VBR:Backup*' }).Count 0
+    $script:FakeRunning = @((New-Sess 'new-1' 'Working' 'Replica'))
+    Check 'fast check: a session of a new type holds the run'         @(@(Get-ActiveVeeamWork -Vbr $true -Vb365 $false) | Where-Object { $_ -like 'VBR:Backup*' }).Count 1
+    $script:FakeRunning = $null
+    [void]@(Get-ActiveVeeamWork -Vbr $true -Vb365 $false)
+    Check 'fast check: an unreadable list later falls back to the full list' "$script:FullCalls $((Get-FastCheck).Enabled)" '2 False'
 
+    Set-Variable -Name FastSessionCheck -Scope Script -Value $null
+    $script:FakeRunning = @()
+    [void]@(Get-ActiveVeeamWork -Vbr $true -Vb365 $false)
+    Check 'fast check: not used when it missed a running session'     (Get-FastCheck).Enabled 'False'
+    Set-Variable -Name FastSessionCheck -Scope Script -Value $null
+    $script:FakeRunning = $null
+    [void]@(Get-ActiveVeeamWork -Vbr $true -Vb365 $false)
+    Check 'fast check: not used when the list cannot be read at the start' (Get-FastCheck).Enabled 'False'
+    Set-Variable -Name FastSessionCheck -Scope Script -Value $null
+    $script:FakeFull = @((New-Sess 'pol-old' 'Stopped' 'SimpleBackupCopyPolicy'))
+    $script:FakeRunning = @()
+    [void]@(Get-ActiveVeeamWork -Vbr $true -Vb365 $false)
+    Check 'fast check: a type in the full list is never left out'     (@((Get-FastCheck).SkippedTypes) -contains 'SimpleBackupCopyPolicy') 'False'
+
+    # File share and object storage sessions are in the running list too, so a fast
+    # check skips their 100-second query. A running one it missed: never fast.
+    function Get-VeeamCoreJob { param($Id) $null }
+    $script:ManagedJobInventory = @([pscustomobject]@{ Family = 'VBRUnstructured'; Id = 'u-1'; Name = 'Example File Share Job'; Enabled = $true; Object = [pscustomobject]@{ Name = 'Example File Share Job' } })
+    $script:NasQueries = 0
+    $script:FakeNas = @()
+    function Get-VBRUnstructuredBackupSession { [CmdletBinding()] param([string] $Name) $script:NasQueries++; $script:FakeNas }
+    Set-Variable -Name FastSessionCheck -Scope Script -Value $null
+    $script:FakeFull = @((New-Sess 'run-1' 'Working')); $script:FakeRunning = @((New-Sess 'run-1' 'Working'))
+    [void]@(Get-ActiveVeeamWork -Vbr $true -Vb365 $false)
+    [void]@(Get-ActiveVeeamWork -Vbr $true -Vb365 $false)
+    Check 'fast check: the file share query runs in the first check only' $script:NasQueries 1
+    Set-Variable -Name FastSessionCheck -Scope Script -Value $null
+    $script:FakeFull = @(); $script:FakeRunning = @()
+    $script:FakeNas = @((New-Sess 'nas-1' 'Working' 'NasBackup' 'Example File Share Job'))
+    [void]@(Get-ActiveVeeamWork -Vbr $true -Vb365 $false)
+    Check 'fast check: not used when it missed a running file share session' (Get-FastCheck).Enabled 'False'
+    $script:ManagedJobInventory = @()
+    Set-Variable -Name FastSessionCheck -Scope Script -Value ([pscustomobject]@{ Enabled = $false; SkippedTypes = @() })
+}
 $script:FakeVboSessions = @((V 'Success'), (V 'Running'), (V 'Queued'), (V 'Updating'), (V 'Disconnected'), (V 'Stopped'))
 $script:FakeVboRestoreSessions = @((V 'Running'))
 $w = @(Get-ActiveVeeamWork -Vbr $false -Vb365 $true)
