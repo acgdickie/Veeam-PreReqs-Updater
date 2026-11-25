@@ -4711,13 +4711,23 @@ function Get-ActiveVeeamWork {
             $inUse = $false
             if (@($collector.Families).Count -gt 0) { $inUse = Test-VbrFamilyInUse $collector.Families }
             $command = Get-Command $collector.Command -ErrorAction SilentlyContinue
-            # Get-VBRTapeBackupSession took 4.4 minutes on a real VBR 12.3 server with no
-            # tape jobs at all. A tape backup session needs a tape job, so skip it when
-            # Veeam lists none. If the tape job list cannot be read, query as before.
-            if ($command -and $collector.Command -eq 'Get-VBRTapeBackupSession' -and (Get-Command Get-VBRTapeJob -ErrorAction SilentlyContinue)) {
-                $tapeJobs = $null
-                try { $tapeJobs = @(Get-VBRTapeJob -ErrorAction Stop -WarningAction SilentlyContinue) } catch {}
-                if ($null -ne $tapeJobs -and $tapeJobs.Count -eq 0) { continue }
+            # These session lists read every session Veeam keeps, which took minutes on a
+            # real VBR 12.3 server that had none of these jobs: tape 4.4 minutes, agent
+            # 30 seconds. Such a session needs such a job, so skip the list when Veeam
+            # lists no job of that kind. If a job list cannot be read, query as before.
+            $jobListsForSessions = @{
+                'Get-VBRTapeBackupSession'        = @('Get-VBRTapeJob')
+                'Get-VBRComputerBackupJobSession' = @('Get-VBRComputerBackupJob','Get-VBRComputerBackupCopyJob')
+            }
+            if ($command -and $jobListsForSessions.ContainsKey($collector.Command)) {
+                $noSuchJobs = $true
+                foreach ($jobGetter in $jobListsForSessions[$collector.Command]) {
+                    if (-not (Get-Command $jobGetter -ErrorAction SilentlyContinue)) { $noSuchJobs = $false; break }
+                    $listed = $null
+                    try { $listed = @(& $jobGetter -ErrorAction Stop -WarningAction SilentlyContinue) } catch {}
+                    if ($null -eq $listed -or $listed.Count -gt 0) { $noSuchJobs = $false; break }
+                }
+                if ($noSuchJobs) { continue }
             }
             if ($inUse -and -not $command) {
                 throw [System.NotSupportedException]::new("$($collector.Command) is unavailable for installed family $($collector.Families -join '/')")

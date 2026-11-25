@@ -27,7 +27,8 @@ you change a script, add your entry at the top.
   with one query for every name (`Get-VBRUnstructuredBackupSession -Name '*'`), not one
   per job: each per-job query took about 94 seconds, so 19 minutes with 12 jobs. Each
   such job's `CBackupJob` is also asked whether it runs now. The tape session list is
-  skipped when Veeam lists no tape jobs: it took 4.4 minutes on a server with none.
+  skipped when Veeam lists no tape jobs (4.4 minutes on a server with none), and the
+  agent session list when it lists no agent jobs (30 seconds).
 * A Veeam program that stays connected to PostgreSQL after every Veeam service has
   stopped no longer stops the run straight away (`PG_CLIENTS_STILL_CONNECTED`, exit
   `10`). Seen on a real VBR 12.3 server: `Veeam.Backup.Manager.exe` and

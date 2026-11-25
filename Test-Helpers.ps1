@@ -941,7 +941,18 @@ $script:ManagedJobInventory = @()
     [void]@(Get-ActiveVeeamWork -Vbr $true -Vb365 $false)
     Check 'tape: an unreadable tape job list still reads the sessions' $script:TapeQueried 2
 }
-# File share and object storage sessions: one query for every name, not one per job
+& {
+    $script:AgentQueried = 0
+    $script:FakeAgentJobs = @(); $script:FakeAgentCopyJobs = @()
+    function Get-VBRComputerBackupJob     { [CmdletBinding()] param() $script:FakeAgentJobs }
+    function Get-VBRComputerBackupCopyJob { [CmdletBinding()] param() $script:FakeAgentCopyJobs }
+    function Get-VBRComputerBackupJobSession { [CmdletBinding()] param() $script:AgentQueried++; @((S 'Working')) }
+    [void]@(Get-ActiveVeeamWork -Vbr $true -Vb365 $false)
+    Check 'agent: no agent jobs, agent sessions are not read' $script:AgentQueried 0
+    $script:FakeAgentCopyJobs = @([pscustomobject]@{ Name = 'Example Agent Copy Job' })
+    $w = @(Get-ActiveVeeamWork -Vbr $true -Vb365 $false)
+    Check 'agent: with an agent copy job, a running agent session holds the run' "$script:AgentQueried $(@($w | Where-Object { $_ -like 'VBR:Agent*' }).Count)" '1 1'
+}# File share and object storage sessions: one query for every name, not one per job
 # (94 seconds each on a real server). Each job's CBackupJob is a second, free signal.
 & {
     $script:UnstructuredNames = @()
