@@ -62,6 +62,21 @@ try {
     $runningIds = @{}
     foreach ($s in @($backupRunning) + @($baseRunning)) { $runningIds["$(Get-Prop $s 'Id')"] = $true }
 
+    Show-Time '1b. Each GetRunning() session, looked up by ID with the cmdlets used today'
+    foreach ($id in @($runningIds.Keys | Where-Object { $_ })) {
+        foreach ($cmd in 'Get-VBRBackupSession','Get-VBRUnstructuredBackupSession') {
+            if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) { continue }
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            try {
+                $hit = @(& $cmd -Id ([guid]$id) -ErrorAction Stop -WarningAction SilentlyContinue)
+                $state = if ($hit.Count) { Get-Prop $hit[0] 'State' } else { '(not returned)' }
+                Write-Host ('  {0,-34} -Id {1}  {2,6:n1} s  {3}' -f $cmd, $id, $sw.Elapsed.TotalSeconds, $state)
+            } catch {
+                Write-Host ('  {0,-34} -Id {1}  {2,6:n1} s  FAILED: {3}' -f $cmd, $id, $sw.Elapsed.TotalSeconds, $_.Exception.Message)
+            }
+        }
+    }
+
     Show-Time '2. Sessions the database shows as not stopped (SELECT only)'
     try {
         $rows = Measure-Step 'backup.model.jobsessions where state <> -1' {
