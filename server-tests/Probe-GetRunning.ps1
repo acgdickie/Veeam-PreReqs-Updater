@@ -100,6 +100,14 @@ try {
             $unstructured = Measure-Step "Get-VBRUnstructuredBackupSession -Name '*'" { Get-VBRUnstructuredBackupSession -Name '*' -ErrorAction Stop }
         }
         $restores = Measure-Step 'Get-VBRRestoreSession' { Get-VBRRestoreSession -ErrorAction Stop }
+        # Read GetRunning() again: a session that started while the slow lists were
+        # read must not count as missed.
+        $backupAfter = Measure-Step 'CBackupSession::GetRunning() again' { [Veeam.Backup.Core.CBackupSession]::GetRunning() }
+        $baseAfter = Measure-Step 'CBaseSession::GetRunning() again' { [Veeam.Backup.Core.CBaseSession]::GetRunning() }
+        foreach ($s in @($backupAfter) + @($baseAfter)) { $runningIds["$(Get-Prop $s 'Id')"] = $true }
+        Write-Host '  Session types in Get-VBRBackupSession (count):'
+        $all | Group-Object { Get-Prop $_ 'JobType' } | Sort-Object Count -Descending |
+            ForEach-Object { Write-Host ("    {0,-36} {1:n0}" -f $_.Name, $_.Count) }
         foreach ($list in @(@{ Name = 'backup'; Items = $all }, @{ Name = 'unstructured'; Items = $unstructured }, @{ Name = 'restore'; Items = $restores })) {
             foreach ($s in @($list.Items | Where-Object { (Get-Prop $_ 'State') -and (Get-Prop $_ 'State') -ne 'Stopped' })) {
                 $id = Get-Prop $s 'Id'
