@@ -924,6 +924,42 @@ $script:FakeVbrJobIsRunning = $true
 $w = @(Get-ActiveVeeamWork -Vbr $true -Vb365 $false)
 Check 'fresh true IsRunning catches a newly-started job' ($w -contains 'VBRJob:IsRunning:running') 'True'
 $script:ManagedJobInventory = @()
+# Tape sessions are skipped when Veeam lists no tape jobs: that list took minutes on a
+# real server with none. With a tape job, or an unreadable list, they are read as before.
+& {
+    $script:TapeQueried = 0
+    $script:FakeTapeJobs = @()
+    $script:FakeTapeJobThrow = $false
+    function Get-VBRTapeJob { [CmdletBinding()] param() if ($script:FakeTapeJobThrow) { throw 'tape jobs unreadable' }; $script:FakeTapeJobs }
+    function Get-VBRTapeBackupSession { [CmdletBinding()] param() $script:TapeQueried++; @((S 'Working')) }
+    $w = @(Get-ActiveVeeamWork -Vbr $true -Vb365 $false)
+    Check 'tape: no tape jobs, tape sessions are not read' "$script:TapeQueried $(@($w | Where-Object { $_ -like 'VBR:Tape*' }).Count)" '0 0'
+    $script:FakeTapeJobs = @([pscustomobject]@{ Name = 'Example Tape Job' })
+    $w = @(Get-ActiveVeeamWork -Vbr $true -Vb365 $false)
+    Check 'tape: with a tape job, a running tape session holds the run' "$script:TapeQueried $(@($w | Where-Object { $_ -like 'VBR:Tape*' }).Count)" '1 1'
+    $script:FakeTapeJobs = @(); $script:FakeTapeJobThrow = $true
+    [void]@(Get-ActiveVeeamWork -Vbr $true -Vb365 $false)
+    Check 'tape: an unreadable tape job list still reads the sessions' $script:TapeQueried 2
+}
+# File share and object storage sessions: one query for every name, not one per job
+# (94 seconds each on a real server). Each job's CBackupJob is a second, free signal.
+& {
+    $script:UnstructuredNames = @()
+    $script:FakeCoreRunning = @{}
+    function Get-VBRUnstructuredBackupSession { [CmdletBinding()] param([string] $Name) $script:UnstructuredNames += $Name; @((S 'Stopped')) }
+    function Get-VeeamCoreJob { param($Id) if ($script:FakeCoreRunning.ContainsKey("$Id")) { [pscustomobject]@{ IsRunning = $script:FakeCoreRunning["$Id"] } } }
+    $script:ManagedJobInventory = @(
+        [pscustomobject]@{ Family = 'VBRUnstructured';     Id = 'u-1'; Name = 'Example File Share Job';        Enabled = $true; Object = [pscustomobject]@{ Name = 'Example File Share Job' } },
+        [pscustomobject]@{ Family = 'VBRUnstructuredCopy'; Id = 'u-2'; Name = 'Example File Share Job (Copy)'; Enabled = $true; Object = [pscustomobject]@{ Name = 'Example File Share Job (Copy)' } })
+    $w = @(Get-ActiveVeeamWork -Vbr $true -Vb365 $false)
+    Check 'unstructured sessions: one query for every name' ($script:UnstructuredNames -join ',') '*'
+    Check 'unstructured sessions: nothing running, nothing holds the run' (@($w | Where-Object { $_ -like '*Unstructured*' }).Count) 0
+    $script:FakeCoreRunning = @{ 'u-1' = $true; 'u-2' = $false }
+    $w = @(Get-ActiveVeeamWork -Vbr $true -Vb365 $false)
+    Check 'unstructured sessions: a running job holds the run' ($w -contains 'VBRUnstructured:IsRunning:Example File Share Job') 'True'
+    Check 'unstructured sessions: a stopped job does not' (@($w | Where-Object { $_ -like '*Copy)' }).Count) 0
+    $script:ManagedJobInventory = @()
+}
 
 $script:FakeVboSessions = @((V 'Success'), (V 'Running'), (V 'Queued'), (V 'Updating'), (V 'Disconnected'), (V 'Stopped'))
 $script:FakeVboRestoreSessions = @((V 'Running'))

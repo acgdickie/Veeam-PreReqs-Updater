@@ -4711,6 +4711,14 @@ function Get-ActiveVeeamWork {
             $inUse = $false
             if (@($collector.Families).Count -gt 0) { $inUse = Test-VbrFamilyInUse $collector.Families }
             $command = Get-Command $collector.Command -ErrorAction SilentlyContinue
+            # Get-VBRTapeBackupSession took 4.4 minutes on a real VBR 12.3 server with no
+            # tape jobs at all. A tape backup session needs a tape job, so skip it when
+            # Veeam lists none. If the tape job list cannot be read, query as before.
+            if ($command -and $collector.Command -eq 'Get-VBRTapeBackupSession' -and (Get-Command Get-VBRTapeJob -ErrorAction SilentlyContinue)) {
+                $tapeJobs = $null
+                try { $tapeJobs = @(Get-VBRTapeJob -ErrorAction Stop -WarningAction SilentlyContinue) } catch {}
+                if ($null -ne $tapeJobs -and $tapeJobs.Count -eq 0) { continue }
+            }
             if ($inUse -and -not $command) {
                 throw [System.NotSupportedException]::new("$($collector.Command) is unavailable for installed family $($collector.Families -join '/')")
             }
@@ -4767,23 +4775,29 @@ function Get-ActiveVeeamWork {
             }
         }
 
-        # Get-VBRUnstructuredBackupSession has no all-sessions parameter set.
-        # Query exact inventory-derived job-name patterns; its -Id parameter is a
-        # session ID and must never be given a job ID.
+        # Get-VBRUnstructuredBackupSession has no all-sessions parameter set, so ask for
+        # every name with -Name '*'; its -Id parameter is a session ID and must never be
+        # given a job ID. One query per job took about 94 seconds each on a real VBR
+        # 12.3 server with 12 such jobs: 19 minutes in every activity check. One query
+        # for '*' returns those sessions and any other, so nothing is missed.
         $unstructuredEntries = @($script:ManagedJobInventory | Where-Object { $_.Family -in @('VBRUnstructured','VBRUnstructuredCopy') })
         if ($unstructuredEntries.Count -gt 0) {
             if (-not (Get-Command Get-VBRUnstructuredBackupSession -ErrorAction SilentlyContinue)) {
                 throw [System.NotSupportedException]::new('Get-VBRUnstructuredBackupSession is unavailable for configured unstructured jobs')
             }
-            $unstructuredSessions = @()
-            foreach ($entry in $unstructuredEntries) {
-                $escapedName = [WildcardPattern]::Escape("$($entry.Name)")
-                $unstructuredSessions += @(Invoke-VeeamEnumeration -Label "Get-VBRUnstructuredBackupSession -Name '$escapedName*'" -Enumerate {
-                    Get-VBRUnstructuredBackupSession -Name "${escapedName}*" -ErrorAction Stop
-                })
-            }
+            $unstructuredSessions = @(Invoke-VeeamEnumeration -Label "Get-VBRUnstructuredBackupSession -Name '*'" -Enumerate {
+                Get-VBRUnstructuredBackupSession -Name '*' -ErrorAction Stop
+            })
             $unstructuredSessions = @($unstructuredSessions | Sort-Object Id -Unique)
             $active += @(Get-ActiveLabelsFromSessions -Sessions $unstructuredSessions -Prefix 'VBR:Unstructured')
+            # A second signal that costs nothing: each job's CBackupJob says whether it
+            # runs now. A job whose CBackupJob cannot be read relies on the query above.
+            foreach ($entry in $unstructuredEntries) {
+                $core = Get-VeeamCoreJob -Id $entry.Id
+                if ($core -and $core.PSObject.Properties.Name -contains 'IsRunning' -and $core.IsRunning -eq $true) {
+                    $active += "$($entry.Family):IsRunning:$($entry.Name)"
+                }
+            }
         }
 
         # Newer VBR builds expose an all-session parameter set. Prefer it so
