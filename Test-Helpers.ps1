@@ -3769,7 +3769,11 @@ Check 'the honest note never names this run folder' ($blockedNoteBody -match [re
         . ([scriptblock]::Create($fn.Extent.Text))
     }
     Check 'module check: nothing asked, nothing wrong' @(Test-VeeamModuleImport).Count 0
-    Check 'module check: a module that does not load is a problem' @(Test-VeeamModuleImport -Vbr).Count 1
+    # A stand-in Import-Module, so the result does not depend on whether this PC has a
+    # Veeam console that loads in this PowerShell edition.
+    function Import-Module { [CmdletBinding()] param([Parameter(Position = 0)] $Name) throw "module $Name does not load in this PowerShell" }
+    Check 'module check: a VBR module that does not load is a problem' ((@(Test-VeeamModuleImport -Vbr) -join ' ') -match '^Veeam\.Backup\.PowerShell: module Veeam\.Backup\.PowerShell does not load') 'True'
+    Check 'module check: a VB365 module that does not load is a problem' @(Test-VeeamModuleImport -Vb365).Count 1
 }
 $recoverBody = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Invoke-ExplicitRecovery' }, $true))[0].Extent.Text
 $moduleCheckAt = $recoverBody.IndexOf('Test-VeeamModuleImport')

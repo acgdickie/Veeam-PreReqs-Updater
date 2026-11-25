@@ -42,7 +42,9 @@ you change a script, add your entry at the top.
   query. The first check reads both and uses the fast list only if it held every
   running session; if not, or if it cannot be read, every check reads the full lists
   as before. Session types the full list leaves out stay out, so stuck system sessions
-  and the backup copy policy session never hold a run.
+  and the backup copy policy session never hold a run. On that server, with 26 schedule
+  objects, a whole `-Install` now takes about 31 minutes, and the jobs are off for about
+  18 minutes instead of more than 3 hours.
 * A Veeam program that stays connected to PostgreSQL after every Veeam service has
   stopped no longer stops the run straight away (`PG_CLIENTS_STILL_CONNECTED`, exit
   `10`). Seen on a real VBR 12.3 server: `Veeam.Backup.Manager.exe` and
