@@ -5699,7 +5699,8 @@ if (Test-Path $script:MarkerFile) {
     Complete-Run $EXIT.ESCALATE 'PRIOR_RUN_INCOMPLETE' "A previous run left a recovery marker ($($script:MarkerFile)), so normal audit/install is blocked."
 }
 if ($Recover) {
-    Complete-Run $EXIT.OK 'RECOVERY_NOT_NEEDED' 'No recovery marker exists. Nothing was changed.'
+    # Complete-Run adds "Nothing was changed." for the UNTOUCHED stage.
+    Complete-Run $EXIT.OK 'RECOVERY_NOT_NEEDED' 'No recovery marker exists.'
 }
 
 # ---------------------------------------------------------------------------
