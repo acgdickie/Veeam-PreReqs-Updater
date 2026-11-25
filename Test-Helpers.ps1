@@ -40,7 +40,7 @@ $want = 'ConvertFrom-ServerVersionNum','ConvertTo-ServerVersionNum',
         'Get-PolicyExitCode','Get-RmmActionForExitCode','Invoke-DelayedReboot',
         'Resolve-PgInstallerLinkFromHtml',
         'Get-VeeamJobFamilyDefinitions','Get-VeeamJobFamilyDefinition',
-        'Get-VeeamCoreJob','Resolve-VeeamCoreType','Get-VeeamRunningBackupSessions','Get-VeeamFastCheckSkippedTypes','New-VeeamFastSessionCheck','Get-VeeamCoreJobScheduleFlag','Get-VeeamJobEnabledFlag','Get-VeeamJobScheduleFingerprint','Get-VeeamJobIdentity','Get-VeeamManagedJobInventory',
+        'Get-VeeamCoreJob','Resolve-VeeamCoreType','Get-VeeamRunningBackupSessions','Get-SessionText','Get-VeeamFastCheckSkippedTypes','New-VeeamFastSessionCheck','Get-VeeamCoreJobScheduleFlag','Get-VeeamJobEnabledFlag','Get-VeeamJobScheduleFingerprint','Get-VeeamJobIdentity','Get-VeeamManagedJobInventory',
         'Invoke-VeeamJobTransition','Get-VeeamJobByRecord','Enable-VeeamJobById','Disable-VeeamManagedJobs','Test-VeeamJobKeptOn','Save-RestoredJobState',
         'Get-ActiveLabelsFromSessions','Get-ActiveVb365OrganizationSyncWork','Get-Vb365QueuedSyncTiming','Write-Vb365StuckSyncOnce','Test-VbrFamilyInUse','Get-BlockingVeeamUiProcesses',
         'Get-ActiveVeeamWork','Wait-VeeamIdle','Find-Vb365MaintenanceBarrier','Start-Vb365MaintenanceBarrier',
@@ -1032,6 +1032,18 @@ $script:ManagedJobInventory = @()
     $script:FakeNas = @((New-Sess 'nas-1' 'Working' 'NasBackup' 'Example File Share Job'))
     [void]@(Get-ActiveVeeamWork -Vbr $true -Vb365 $false)
     Check 'fast check: not used when it missed a running file share session' (Get-FastCheck).Enabled 'False'
+    # Real file share session objects have no JobType or JobName (seen on a real VBR
+    # 12.3 server, where strict mode stopped the run). The first check must still work.
+    Set-Variable -Name FastSessionCheck -Scope Script -Value $null
+    $script:FakeFull = @(); $script:FakeRunning = @((New-Sess 'nas-3' 'Working' 'NasBackup'))
+    $script:FakeNas = @([pscustomobject]@{ Id = 'nas-3'; Name = 'Example File Share Job'; State = 'Working' },
+                        [pscustomobject]@{ Id = 'nas-4'; Name = 'Example File Share Job'; State = 'Stopped' })
+    Check 'fast check: file share sessions without JobType are read' (Throws { [void]@(Get-ActiveVeeamWork -Vbr $true -Vb365 $false) }) 'False'
+    Check 'fast check: proven when the running list holds the file share session' (Get-FastCheck).Enabled 'True'
+    Set-Variable -Name FastSessionCheck -Scope Script -Value $null
+    $script:FakeRunning = @()
+    [void]@(Get-ActiveVeeamWork -Vbr $true -Vb365 $false)
+    Check 'fast check: a missed file share session without JobType turns it off' (Get-FastCheck).Enabled 'False'
     $script:ManagedJobInventory = @()
     Set-Variable -Name FastSessionCheck -Scope Script -Value ([pscustomobject]@{ Enabled = $false; SkippedTypes = @() })
 }
@@ -2326,6 +2338,8 @@ Check 'report has a ConsolesClosed field'        ($scriptText -match "(?m)^\s+Co
 
 '--- Leftover Veeam programs still connected to PostgreSQL after the services stop ---'
 Check 'leftover programs: only the job manager and satellite' ((Get-VeeamPgClientProgramNames) -join ',') 'Veeam.Backup.Manager,Veeam.Backup.Satellite'
+Check 'session text: a missing property is empty'    (Get-SessionText ([pscustomobject]@{ Name = 'x' }) 'JobType') ''
+Check 'session text: the first name it has wins'    (Get-SessionText ([pscustomobject]@{ Name = 'n'; State = 'Working' }) 'JobName','Name') 'n'
 Check 'client summary names each session' (Format-PgClientSummary @([pscustomobject]@{ pid = 1; user = 'postgres'; database = 'VeeamBackup'; application = 'x'; client = '127.0.0.1/32'; state = 'idle' })) 'pid=1,user=postgres,db=VeeamBackup,app=x,client=127.0.0.1/32,state=idle'
 & {
     $script:FakeProcs = @{ 19436 = 'Veeam.Backup.Manager'; 23832 = 'Veeam.Backup.Satellite'; 500 = 'pgAdmin4' }

@@ -4684,6 +4684,19 @@ function Get-VeeamRunningBackupSessions {
     try { return ,@($type::GetRunning()) } catch { return $null }
 }
 
+# A property of a session object as text: the first of the names it has, or '' when it
+# has none. The session lists return different object types, and this script runs in
+# strict mode, where reading a property an object does not have is an error.
+function Get-SessionText {
+    param($Session, [Parameter(Mandatory)][string[]] $Name)
+    foreach ($propertyName in $Name) {
+        if ($null -ne $Session -and $Session.PSObject.Properties.Name -contains $propertyName -and $null -ne $Session.$propertyName) {
+            return "$($Session.$propertyName)"
+        }
+    }
+    return ''
+}
+
 # Session types that GetRunning() returns but Get-VBRBackupSession leaves out, seen on
 # a real VBR 12.3 server: the backup copy policy session, which shows Working while
 # the copy job is on, and system sessions that stay Working for weeks. A type the
@@ -4701,20 +4714,25 @@ function New-VeeamFastSessionCheck {
         Write-Log "  Every activity check in this run reads the full session list: Veeam's running-session list (CBackupSession::GetRunning) could not be read." WARN
         return [pscustomobject]@{ Enabled = $false; SkippedTypes = @() }
     }
+    # File share and object storage session objects have no JobType, and this script
+    # runs in strict mode, so every property is read through Get-SessionText.
     $fullTypes = @{}
-    foreach ($session in @($FullList)) { $fullTypes["$($session.JobType)"] = $true }
+    foreach ($session in @($FullList)) { $fullTypes[(Get-SessionText $session 'JobType')] = $true }
     $runningIds = @{}
-    foreach ($session in @($RunningBefore) + @($RunningAfter)) { $runningIds["$($session.Id)"] = $true }
+    foreach ($session in @($RunningBefore) + @($RunningAfter)) { $runningIds[(Get-SessionText $session 'Id')] = $true }
     $missed = @()
-    foreach ($session in @($FullList | Where-Object { "$($_.State)" -ne 'Stopped' })) {
+    foreach ($session in @($FullList | Where-Object { (Get-SessionText $_ 'State','Status') -ne 'Stopped' })) {
         $isActive = @(Get-ActiveLabelsFromSessions -Sessions @($session) -Prefix 'VBR:Backup').Count -gt 0
-        if ($isActive -and -not $runningIds.ContainsKey("$($session.Id)")) { $missed += "$($session.JobName) ($($session.Id))" }
+        $sessionId = Get-SessionText $session 'Id'
+        if ($isActive -and -not ($sessionId -and $runningIds.ContainsKey($sessionId))) {
+            $missed += "$(Get-SessionText $session 'JobName','Name') ($sessionId)"
+        }
     }
     if ($missed.Count -gt 0) {
         Write-Log "  Every activity check in this run reads the full session list: Veeam's running-session list did not list running session(s) $($missed -join ', ')." WARN
         return [pscustomobject]@{ Enabled = $false; SkippedTypes = @() }
     }
-    $skipped = @(@(Get-VeeamFastCheckSkippedTypes) + @(@($RunningBefore) | ForEach-Object { "$($_.JobType)" }) |
+    $skipped = @(@(Get-VeeamFastCheckSkippedTypes) + @(@($RunningBefore) | ForEach-Object { Get-SessionText $_ 'JobType' }) |
         Where-Object { $_ -and -not $fullTypes.ContainsKey($_) } | Sort-Object -Unique)
     Write-Log "  Later activity checks in this run use Veeam's running-session list: it held every running session. Session types the full list leaves out stay out: $($skipped -join ', ')."
     return [pscustomobject]@{ Enabled = $true; SkippedTypes = $skipped }
@@ -4747,7 +4765,7 @@ function Get-ActiveVeeamWork {
                 Write-Log "  Veeam's running-session list could not be read; this and every later check read the full session list" WARN
             } else {
                 $useFast = $true
-                $kept = @($fastRunning | Where-Object { @($fastCheck.SkippedTypes) -notcontains "$($_.JobType)" })
+                $kept = @($fastRunning | Where-Object { @($fastCheck.SkippedTypes) -notcontains (Get-SessionText $_ 'JobType') })
                 $active += @(Get-ActiveLabelsFromSessions -Sessions $kept -Prefix 'VBR:Backup')
             }
         }
