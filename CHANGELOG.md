@@ -5,6 +5,34 @@ All notable changes, newest first. The format follows
 numbers, so each entry is the date the change reached GitHub, with its commit IDs. When
 you change a script, add your entry at the top.
 
+## 2026-11-27
+
+### Fixed
+
+* On VBR 13, an Install that had updated PostgreSQL could end with
+  `SERVICES_UNHEALTHY_JOBS_DISABLED` (exit `40`) and leave the jobs off. After the
+  services started again, the run connected to Veeam once, and got `Connect-VBRServer
+  -Server localhost failed: Failed to connect to Identity service`. The same connection,
+  made by hand as SYSTEM, stopped at "Do you trust this certificate?". An RMM run cannot
+  answer that. Now:
+  * On VBR 13 or later, the run accepts the certificate of this server's own Veeam Backup
+    Service for that local connection (`Connect-VBRServer -ForceAcceptTlsCertificate`). The
+    version comes from `Veeam.Backup.Service.exe`. VBR 12 connects as before.
+  * When the run has just started Veeam services, its reconnect gives each connection
+    (VBR and VB365) up to 10 minutes, with a try every 15 seconds. VBR 13's Identity
+    Service can accept connections minutes after the Veeam Backup Service shows Running.
+    Every other connection still tries once. That includes the checks before any change,
+    and a reconnect after a connection is lost later in the run.
+* A rollback after the Veeam services were stopped started them again, but did not
+  connect to VBR again before it turned the jobs back on. On VBR 13 that connection does
+  not survive the restart, so the jobs could stay off. The rollback now reconnects first,
+  as STEP 20 does. If that fails, it logs a warning and still tries the jobs, as before.
+* A run that found a leftover Enterprise Manager or Veeam ONE registry record said so
+  only in the log and in `StaleEmRecord` or `StaleVeeamOneRecord`. `ActionRequired` now
+  names the record and the switch that removes it (`-RemoveStaleEnterpriseManagerRecord`
+  or `-RemoveStaleVeeamOneRecord`). On exit `0` it replaces `None`. It is left out on exit
+  `40` and `50`, which page an operator for something more urgent.
+
 ## 2026-11-25
 
 ### Fixed

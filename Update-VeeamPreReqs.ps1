@@ -272,6 +272,11 @@ $script:StaleVeeamOneKey = $null
 # Service can take minutes because it starts and waits on the Identity Service as
 # a child process, so the Windows 30-second service-start timeout fires first.
 $script:ServiceSettleMinutes = 10
+# After a run starts the Veeam services again, how long each Veeam connection may keep
+# failing before it counts as a problem, and the pause between tries. A service can
+# show Running before VBR 13's Identity Service (its child process) accepts connections.
+$script:VeeamConnectWaitSeconds = 600
+$script:VeeamConnectPauseSeconds = 15
 $script:Vb365MaintenanceSessionId = $null
 $script:Vb365MaintenancePending = $false
 $script:RecoveryState = $null
@@ -2236,7 +2241,7 @@ function Invoke-NatsOnlyUpdate {
             $healthProblems += "$($pgSvc.Name) (database health/version query failed: $($pgHealth.StdErr) $($pgHealth.StdOut))"
         }
     } catch { $healthProblems += "$($pgSvc.Name) (health query failed: $($_.Exception.Message))" }
-    $postStartModuleProblems = @(Connect-VeeamModules -Vb365 -Quiet -Reconnect)
+    $postStartModuleProblems = @(Connect-VeeamModules -Vb365 -Quiet -Reconnect -AfterRestart)
     if ($postStartModuleProblems.Count -gt 0) { $healthProblems += @($postStartModuleProblems) }
     # VB365 held a connection to NATS before the update, so it must hold one again.
     if ([bool]$natsPlan.BaselineVb365Connected -and $healthProblems.Count -eq 0) {
@@ -2477,9 +2482,20 @@ function Invoke-Rollback {
         } catch { $problems += "PostgreSQL health check: $($_.Exception.Message)" }
     }
 
+    # The services were started again above, and that ends the VBR module's connection.
+    # Reconnect before the jobs are turned back on, as STEP 20 does. If it still fails,
+    # say so and try the jobs anyway: before this reconnect existed, the rollback went
+    # straight to the jobs, and on VBR 12 they came back on.
+    if ($script:Stage -eq 'SERVICES_STOPPED' -and $problems.Count -eq 0 -and "$($script:Report.VeeamProducts)" -match '(^|\+)VBR($|\+)') {
+        $vbrReconnect = @(Connect-VeeamModules -Vbr -Quiet -Reconnect -AfterRestart)
+        if ($vbrReconnect.Count -gt 0) {
+            Write-Log "Could not connect to VBR again after the services started: $($vbrReconnect -join ' | '). Trying to turn the jobs back on anyway." WARN
+        }
+    }
+
     if ($problems.Count -eq 0 -and ($script:Vb365MaintenanceSessionId -or $script:Vb365MaintenancePending)) {
         try {
-            $vbReconnect = @(Connect-VeeamModules -Vb365 -Quiet -Reconnect)
+            $vbReconnect = @(Connect-VeeamModules -Vb365 -Quiet -Reconnect -AfterRestart)
             if ($vbReconnect.Count -gt 0) { throw ($vbReconnect -join ' | ') }
             if ($script:Vb365MaintenancePending) { Resolve-Vb365PendingMaintenanceBarrier }
             if ($script:Vb365MaintenanceSessionId) { Stop-Vb365MaintenanceBarrier -SessionId $script:Vb365MaintenanceSessionId }
@@ -2830,6 +2846,36 @@ function Add-RunSideEffectNotes {
     return ((@($StateNote) + $notes) | Where-Object { $_ }) -join ' '
 }
 
+# The next step for a leftover registry record of an uninstalled Veeam product, for
+# ActionRequired. The record changes nothing, but the summary must name it, not only the
+# log. Returns '' when there is none, and on exit 40 or 50: the person paged then has
+# more urgent work, and the StaleEmRecord and StaleVeeamOneRecord fields still show it.
+# A run whose removal of that record failed gets no step for it: Detail says why, and
+# the step would only send the operator to the switch that just failed.
+function Get-LeftoverRecordAction {
+    param([Parameter(Mandatory)] $Report, [int] $Code)
+    if ($Code -ge 40) { return '' }
+    $issue = "$($Report['IssueCode'])"
+    $steps = @()
+    if ("$($Report['StaleEmRecord'])" -eq 'present' -and $issue -ne 'STALE_EM_RECORD_REMOVE_FAILED') {
+        $steps += 'A leftover Enterprise Manager registry record is on this server (StaleEmRecord). To remove it, run this script once with -RemoveStaleEnterpriseManagerRecord. That run saves a .reg backup first.'
+    }
+    if ("$($Report['StaleVeeamOneRecord'])" -eq 'present' -and $issue -ne 'STALE_VEEAM_ONE_RECORD_REMOVE_FAILED') {
+        $steps += 'A leftover Veeam ONE registry record is on this server (StaleVeeamOneRecord). To remove it, run this script once with -RemoveStaleVeeamOneRecord. That run saves a .reg backup first.'
+    }
+    return ($steps -join ' ')
+}
+
+# Add a step to ActionRequired. 'None' becomes the step. A booked restart's
+# 'None. The server restarts at ...' loses its 'None.', so it never says None and then
+# gives a step.
+function Join-ActionRequired {
+    param([AllowEmptyString()][string] $Action = '', [Parameter(Mandatory)][string] $Step)
+    if (-not $Action -or $Action -eq 'None') { return $Step }
+    if ($Action -like 'None. *') { return "$($Action.Substring(6)) Also: $Step" }
+    return "$Action Also: $Step"
+}
+
 function Complete-Run {
     param(
         [Parameter(Mandatory)][int] $Code,
@@ -3002,6 +3048,10 @@ function Complete-Run {
         if (-not $script:Report.IssueCode) { $script:Report.IssueCode = 'NATS_HASH_CONFLICT' }
         $conflictAction = 'Investigate NatsStatus=HASH_CONFLICT: the NATS release on GitHub no longer matches the SHA256 built into this script, so NATS was left alone. See NatsDetail.'
         $script:Report.ActionRequired = if ("$($script:Report.ActionRequired)" -eq 'None') { $conflictAction } else { "$($script:Report.ActionRequired) $conflictAction" }
+    }
+    $leftoverAction = Get-LeftoverRecordAction -Report $script:Report -Code $finalCode
+    if ($leftoverAction) {
+        $script:Report.ActionRequired = Join-ActionRequired -Action "$($script:Report.ActionRequired)" -Step $leftoverAction
     }
     if (-not $script:Report.JobsLeftDisabled -and $finalCode -ge $EXIT.ESCALATE -and $script:DisabledJobs.Count -gt 0) {
         $script:Report.JobsLeftDisabled = (Get-UnrestoredJobNames -Records $script:DisabledJobs) -join ', '
@@ -3547,9 +3597,65 @@ function Test-VeeamModuleImport {
     return $failed
 }
 
+# The installed VBR major version (12, 13, ...), read the way STEP 3 reads it: from
+# the file version of the Veeam Backup Service. 0 when it cannot be read. It does not
+# rely on STEP 3, because -Recover runs before STEP 3.
+function Get-VbrMajorVersion {
+    try {
+        $corePath = "$(Get-RegValue 'HKLM:\SOFTWARE\Veeam\Veeam Backup and Replication' 'CorePath')"
+        if (-not $corePath) { return 0 }
+        foreach ($file in @('Veeam.Backup.Service.exe', 'Packages\VeeamDeploymentDll.dll')) {
+            $fileVersion = "$(Get-FileVersionSafe (Join-Path $corePath $file))"
+            if ($fileVersion -match '^\s*(\d+)\.') { return [int]$Matches[1] }
+        }
+    } catch {}
+    return 0
+}
+
+# Run one Veeam connect call. Try again every PauseSeconds until it works or
+# WaitSeconds have passed. Returns '' when it worked, else the last error message.
+# WaitSeconds 0 means one attempt only.
+function Invoke-VeeamConnectWithRetry {
+    param(
+        [Parameter(Mandatory)][string] $Name,
+        [Parameter(Mandatory)][scriptblock] $Connect,
+        [ValidateRange(0, 3600)][int] $WaitSeconds = 0,
+        [ValidateRange(0, 300)][int] $PauseSeconds = 15
+    )
+    $deadline = (Get-Date).AddSeconds($WaitSeconds)
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        $connectError = ''
+        try { & $Connect | Out-Null }
+        catch {
+            $connectError = "$($_.Exception.Message)"
+            if (-not $connectError) { $connectError = "$($_.Exception.GetType().FullName) with no message" }
+        }
+        if (-not $connectError) {
+            if ($attempt -gt 1) { Write-Log "  $Name worked on attempt $attempt" OK }
+            return ''
+        }
+        if ($WaitSeconds -le 0 -or (Get-Date).AddSeconds($PauseSeconds) -ge $deadline) { return $connectError }
+        Write-Log "  $Name failed (attempt $attempt): $(Format-ShortText $connectError 300). Veeam may still be starting; trying again in ${PauseSeconds}s."
+        Start-Sleep -Seconds $PauseSeconds
+    }
+}
+
+# -AfterRestart: Veeam services were just started, so give each connection up to
+# $script:VeeamConnectWaitSeconds to work. Without it, each connection gets one try.
 function Connect-VeeamModules {
-    param([switch] $Vbr, [switch] $Vb365, [switch] $Quiet, [switch] $Reconnect)
+    param([switch] $Vbr, [switch] $Vb365, [switch] $Quiet, [switch] $Reconnect, [switch] $AfterRestart)
     $failed = @()
+    # Read defensively: the tests exercise this function on its own, where the
+    # script-scope settings do not exist and StrictMode would make reading them fatal.
+    $waitSeconds = 0
+    $pauseSeconds = Get-Variable -Name VeeamConnectPauseSeconds -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -eq $pauseSeconds) { $pauseSeconds = 15 }
+    if ($AfterRestart) {
+        $waitSeconds = Get-Variable -Name VeeamConnectWaitSeconds -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+        if ($null -eq $waitSeconds) { $waitSeconds = 600 }
+    }
     if ($Vbr) {
         try { Import-Module Veeam.Backup.PowerShell -ErrorAction Stop -WarningAction SilentlyContinue }
         catch { $failed += "Veeam.Backup.PowerShell (use the PowerShell version required by the installed VBR build): $($_.Exception.Message)" }
@@ -3559,25 +3665,44 @@ function Connect-VeeamModules {
         # one, ex. Connect-VBRServer -Server localhost". Reconnect explicitly after any
         # service restart, or the final activity check fails and schedules stay off.
         if ($Reconnect -and $failed.Count -eq 0) {
-            if (Get-Command Disconnect-VBRServer -ErrorAction SilentlyContinue) {
-                try { Disconnect-VBRServer -ErrorAction Stop | Out-Null } catch {}
-            }
-            if (Get-Command Connect-VBRServer -ErrorAction SilentlyContinue) {
-                try { Connect-VBRServer -Server localhost -ErrorAction Stop | Out-Null }
-                catch { $failed += "Connect-VBRServer -Server localhost failed: $($_.Exception.Message)" }
+            $vbrConnectCommand = Get-Command Connect-VBRServer -ErrorAction SilentlyContinue
+            if ($vbrConnectCommand) {
+                $vbrCanDisconnect = [bool](Get-Command Disconnect-VBRServer -ErrorAction SilentlyContinue)
+                $vbrConnectArgs = @{ Server = 'localhost'; ErrorAction = 'Stop' }
+                # VBR 13 asks "Do you trust this certificate?" the first time an account
+                # connects. An RMM run cannot answer, so the connection fails; on a real
+                # VBR 13 server it failed with "Failed to connect to Identity service".
+                # This connection is always to localhost, this server's own Veeam Backup
+                # Service, so accept its certificate. Only on VBR 13 or later, and only
+                # when the cmdlet has the switch: VBR 12 connects as it always has.
+                if ((Get-VbrMajorVersion) -ge 13 -and $vbrConnectCommand.Parameters.ContainsKey('ForceAcceptTlsCertificate')) {
+                    $vbrConnectArgs['ForceAcceptTlsCertificate'] = $true
+                }
+                $vbrProblem = Invoke-VeeamConnectWithRetry -Name 'Connect-VBRServer -Server localhost' -WaitSeconds $waitSeconds -PauseSeconds $pauseSeconds -Connect {
+                    # A failed attempt can leave half a session; end it before each try.
+                    if ($vbrCanDisconnect) { try { Disconnect-VBRServer -ErrorAction Stop | Out-Null } catch {} }
+                    Connect-VBRServer @vbrConnectArgs | Out-Null
+                }
+                if ($vbrProblem) { $failed += "Connect-VBRServer -Server localhost failed: $vbrProblem" }
             } else {
                 $failed += 'Connect-VBRServer is unavailable, so the VBR connection cannot be re-established after the service restart'
             }
         }
     }
     if ($Vb365) {
+        $vb365Loaded = $false
         try {
             Import-Module (Get-Vb365ModulePath) -ErrorAction Stop -WarningAction SilentlyContinue
-            if ($Reconnect -and (Get-Command Disconnect-VBOServer -ErrorAction SilentlyContinue)) {
-                try { Disconnect-VBOServer -ErrorAction Stop | Out-Null } catch {}
-            }
-            Connect-VBOServer -ErrorAction Stop
+            $vb365Loaded = $true
         } catch { $failed += "Veeam.Archiver.PowerShell (needs PowerShell 7.4.2+): $($_.Exception.Message)" }
+        if ($vb365Loaded) {
+            $vb365CanDisconnect = $Reconnect -and [bool](Get-Command Disconnect-VBOServer -ErrorAction SilentlyContinue)
+            $vb365Problem = Invoke-VeeamConnectWithRetry -Name 'Connect-VBOServer' -WaitSeconds $waitSeconds -PauseSeconds $pauseSeconds -Connect {
+                if ($vb365CanDisconnect) { try { Disconnect-VBOServer -ErrorAction Stop | Out-Null } catch {} }
+                Connect-VBOServer -ErrorAction Stop
+            }
+            if ($vb365Problem) { $failed += "Veeam.Archiver.PowerShell (needs PowerShell 7.4.2+): $vb365Problem" }
+        }
     }
     if ($failed.Count -gt 0 -and -not $Quiet) { Write-Log "Veeam module problem: $($failed -join ' | ')" WARN }
     return $failed
@@ -5472,7 +5597,7 @@ function Invoke-ExplicitRecovery {
         $hasVbr = "$($state.Products)" -match '(^|\+)VBR($|\+)'
         $hasVb365 = "$($state.Products)" -match '(^|\+)VB365($|\+)'
         # Services were just restarted here, so VBR needs reconnecting too, not only VB365.
-        $moduleProblems = @(Connect-VeeamModules -Vbr:$hasVbr -Vb365:$hasVb365 -Reconnect)
+        $moduleProblems = @(Connect-VeeamModules -Vbr:$hasVbr -Vb365:$hasVb365 -Reconnect -AfterRestart)
         if ($moduleProblems.Count -gt 0) { $problems += $moduleProblems }
         else {
             try {
@@ -7156,7 +7281,7 @@ if ($hasVbr) {
             Write-Log "Started $($startedServices -join ', ') and left them running, because they are set to start automatically. Waiting 30 seconds for VBR to reach its repositories, then retrying the configuration backup once." WARN
             Start-Sleep -Seconds 30
             if ($cfgAttempt.ConnectionLost) {
-                $cfgReconnectProblems = @(Connect-VeeamModules -Vbr -Quiet -Reconnect)
+                $cfgReconnectProblems = @(Connect-VeeamModules -Vbr -Quiet -Reconnect -AfterRestart)
                 if ($cfgReconnectProblems.Count -gt 0) { Write-Log "Could not re-establish the VBR connection before the retry: $($cfgReconnectProblems -join ' | ')" WARN }
             }
             $retryNote = " This run started the stopped automatic Veeam service(s) $($startedServices -join ', ') and retried once. The first attempt failed with: $(Format-ShortText $firstWhy 200)."
@@ -7935,7 +8060,7 @@ if ($hasVbr) {
 # The VB365 controller connection does not survive its service restart. Reconnect
 # before releasing repository maintenance or touching schedules. VBR is imported
 # again as a harmless health check of its local module surface.
-$postStartModuleProblems = @(Connect-VeeamModules -Vbr:$hasVbr -Vb365:$hasVb365 -Quiet -Reconnect)
+$postStartModuleProblems = @(Connect-VeeamModules -Vbr:$hasVbr -Vb365:$hasVb365 -Quiet -Reconnect -AfterRestart)
 if ($postStartModuleProblems.Count -gt 0) { $notRunning += @($postStartModuleProblems) }
 if ($notRunning.Count -eq 0 -and $pgFinalProblems.Count -eq 0) {
     Write-Log 'All Veeam service startup types and running states were restored' OK

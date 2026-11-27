@@ -69,6 +69,8 @@ The report field `StaleEmRecord` shows the result:
 | `present` | A leftover key was found |
 | `removed; backup <path>` | The key was deleted |
 
+When the field is `present`, `ActionRequired` names `-RemoveStaleEnterpriseManagerRecord` too, so the summary shows the next step. It does not on exit `40` and `50`, because those runs page an operator for something more urgent.
+
 ### Connection record: inside the VBR database
 
 `Clear-StaleEnterpriseManagerRecord.ps1` covers the record inside the VBR database. See [the separate tool](#the-separate-tool-clear-staleenterprisemanagerrecordps1) below.

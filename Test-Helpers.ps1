@@ -1695,7 +1695,7 @@ try {
             return [pscustomobject]@{ ExitCode=0; StdOut="$script:FakePgNum"; StdErr='' }
         }
         function Restore-VeeamServiceState { param([switch]$AllowStops) $script:Actions += "RESTORE:$(@($script:VeeamServices).Count):$(@($script:VeeamServices | ForEach-Object { $_.Name }) -join '+')"; @() }
-        function Connect-VeeamModules { param([switch]$Vbr, [switch]$Vb365, [switch]$Quiet, [switch]$Reconnect) @() }
+        function Connect-VeeamModules { param([switch]$Vbr, [switch]$Vb365, [switch]$Quiet, [switch]$Reconnect, [switch]$AfterRestart) @() }
         function Get-VeeamManagedJobInventory { param([bool]$Vbr, [bool]$Vb365) @() }
         function Wait-VeeamIdle { param([bool]$Vbr, [bool]$Vb365, [int]$TimeoutMinutes, [string]$Context, [switch]$CloseConsoles) [pscustomobject]@{ Idle=$true; Labels=@() } }
         function Enable-VeeamJobById { param($Record) $script:Actions += "ENABLE:$($Record.Name)" }
@@ -2100,7 +2100,7 @@ Check 'services are started from one place'      $serviceStartCalls.Count 1
 $retryGate = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] -and $n.Clauses[0].Item1.Extent.Text -eq '$startedServices.Count -eq 0' }, $true))
 $isCfgAttempt = { param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Invoke-VbrConfigBackupAttempt' }
 Check 'no retry unless a service started'        ($retryGate.Count -eq 1 -and $null -ne $retryGate[0].ElseClause -and @($retryGate[0].Clauses[0].Item2.FindAll($isCfgAttempt, $true)).Count -eq 0 -and @($retryGate[0].ElseClause.FindAll($isCfgAttempt, $true)).Count -eq 1) 'True'
-Check 'a lost connection is re-established before the retry' ($scriptText -match "(?s)Start-StoppedAutomaticVeeamServices.*?if \(\`$cfgAttempt\.ConnectionLost\) \{\s+\`$cfgReconnectProblems = @\(Connect-VeeamModules -Vbr -Quiet -Reconnect\).*?\`$cfgAttempt = Invoke-VbrConfigBackupAttempt") 'True'
+Check 'a lost connection is re-established before the retry' ($scriptText -match "(?s)Start-StoppedAutomaticVeeamServices.*?if \(\`$cfgAttempt\.ConnectionLost\) \{\s+\`$cfgReconnectProblems = @\(Connect-VeeamModules -Vbr -Quiet -Reconnect -AfterRestart\).*?\`$cfgAttempt = Invoke-VbrConfigBackupAttempt") 'True'
 Check 'retry happens inside the failure branch'  ($scriptText -match "(?s)if \(\`$cfgAttempt\.Error -or \`$cfgAttempt\.Result -eq 'Failed'\) \{.*?Start-StoppedAutomaticVeeamServices.*?\`$cfgAttempt = Invoke-VbrConfigBackupAttempt") 'True'
 Check 'failure detail carries the retry note'    ($scriptText -match '\$reasonText\$retryNote Refusing to update PostgreSQL') 'True'
 Check 'started services reach the RMM summary'   ($scriptText -match "Add-ReportListItem -Field 'ServicesStarted'") 'True'
@@ -2604,10 +2604,10 @@ Check 'registry read uses GetValue'     ($scriptText -match '\$item\.GetValue\(\
 # The VBR module keeps a live connection to the Veeam Backup Service. Restarting that
 # service drops it, so the script must reconnect before its final activity check.
 Check 'VBR reconnect: disconnect first'  ($scriptText -match 'Disconnect-VBRServer -ErrorAction Stop') 'True'
-Check 'VBR reconnect: connect local'    ($scriptText -match 'Connect-VBRServer -Server localhost -ErrorAction Stop') 'True'
+Check 'VBR reconnect: connect local'    ($scriptText -match [regex]::Escape("`$vbrConnectArgs = @{ Server = 'localhost'; ErrorAction = 'Stop' }") -and $scriptText -match [regex]::Escape('Connect-VBRServer @vbrConnectArgs | Out-Null')) 'True'
 Check 'missing Connect-VBRServer fails' ($scriptText -match 'Connect-VBRServer is unavailable, so the VBR connection cannot be re-established') 'True'
-Check 'post-start reconnects both'      ($scriptText -match 'Connect-VeeamModules -Vbr:\$hasVbr -Vb365:\$hasVb365 -Quiet -Reconnect\)') 'True'
-Check 'recovery reconnects both'        ($scriptText -match 'Connect-VeeamModules -Vbr:\$hasVbr -Vb365:\$hasVb365 -Reconnect\)') 'True'
+Check 'post-start reconnects both'      ($scriptText -match 'Connect-VeeamModules -Vbr:\$hasVbr -Vb365:\$hasVb365 -Quiet -Reconnect -AfterRestart\)') 'True'
+Check 'recovery reconnects both'        ($scriptText -match 'Connect-VeeamModules -Vbr:\$hasVbr -Vb365:\$hasVb365 -Reconnect -AfterRestart\)') 'True'
 Check 'no VB365-only reconnect left'    ($scriptText -match 'Connect-VeeamModules .*-Reconnect:\$hasVb365') 'False'
 Check 'lost-connection matcher: Veeam'  (Test-VbrConnectionLostError ([pscustomobject]@{ Exception = [pscustomobject]@{ Message = 'Remote connection was terminated. Either re-establish remote connection or use local one, ex. Connect-VBRServer -Server localhost' } })) 'True'
 Check 'lost-connection matcher: other'  (Test-VbrConnectionLostError ([pscustomobject]@{ Exception = [pscustomobject]@{ Message = 'Access is denied' } })) 'False'
@@ -3488,7 +3488,7 @@ try {
             [pscustomobject]@{ ExitCode=0; StdOut='150019'; StdErr='' }
         }
         function Restore-VeeamServiceState { param([switch] $AllowStops) $script:Actions += 'RESTORE'; @() }
-        function Connect-VeeamModules { param([switch] $Vbr, [switch] $Vb365, [switch] $Quiet, [switch] $Reconnect) @() }
+        function Connect-VeeamModules { param([switch] $Vbr, [switch] $Vb365, [switch] $Quiet, [switch] $Reconnect, [switch] $AfterRestart) @() }
         function Get-VeeamManagedJobInventory { param([bool] $Vbr, [bool] $Vb365) @() }
         function Wait-VeeamIdle { param([bool] $Vbr, [bool] $Vb365, [int] $TimeoutMinutes, [string] $Context, [switch] $CloseConsoles) [pscustomobject]@{ Idle=$true; Labels=@() } }
         function Enable-VeeamJobById { param($Record) $script:Actions += "ENABLE:$($Record.Name)" }
@@ -3775,6 +3775,163 @@ Check 'the honest note never names this run folder' ($blockedNoteBody -match [re
     Check 'module check: a VBR module that does not load is a problem' ((@(Test-VeeamModuleImport -Vbr) -join ' ') -match '^Veeam\.Backup\.PowerShell: module Veeam\.Backup\.PowerShell does not load') 'True'
     Check 'module check: a VB365 module that does not load is a problem' @(Test-VeeamModuleImport -Vb365).Count 1
 }
+
+'--- Reconnecting to Veeam: the VBR 13 certificate prompt, and a slow start ---'
+& {
+    foreach ($fn in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -in @('Connect-VeeamModules', 'Invoke-VeeamConnectWithRetry', 'Get-VbrMajorVersion', 'Format-ShortText') }, $true)) {
+        . ([scriptblock]::Create($fn.Extent.Text))
+    }
+    # Stand-ins, so nothing here depends on a Veeam console on this PC.
+    function Import-Module { [CmdletBinding()] param([Parameter(Position = 0)] $Name) }
+    function Get-Vb365ModulePath { 'Veeam.Archiver.PowerShell' }
+    function Disconnect-VBRServer { [CmdletBinding()] param() $script:vbrDisconnects++ }
+    function Disconnect-VBOServer { [CmdletBinding()] param() $script:vboDisconnects++ }
+    # Dot-sourced where they are needed, so each stand-in stays inside this block.
+    $connectWithSwitch = {
+        function Connect-VBRServer { [CmdletBinding()] param([string] $Server, [switch] $ForceAcceptTlsCertificate)
+            $script:vbrConnects++; $script:vbrServer = $Server; $script:vbrForced = [bool]$ForceAcceptTlsCertificate
+            if ($script:vbrConnects -le $script:vbrFailures) { throw 'Failed to connect to Identity service' }
+            'a session object that must not leak into the result' }
+    }
+    $connectWithoutSwitch = {
+        function Connect-VBRServer { [CmdletBinding()] param([string] $Server)
+            $script:vbrConnects++; $script:vbrServer = $Server; $script:vbrForced = $false
+            if ($script:vbrConnects -le $script:vbrFailures) { throw 'Failed to connect to Identity service' } }
+    }
+    function Reset-ConnectCounters { param([int] $Failures = 0)
+        $script:vbrConnects = 0; $script:vbrDisconnects = 0; $script:vbrFailures = $Failures; $script:vbrForced = $null; $script:vbrServer = '' }
+    $script:VeeamConnectPauseSeconds = 0
+    $script:VeeamConnectWaitSeconds = 30
+
+    # VBR 13 with the switch: the local certificate is accepted, so no prompt.
+    function Get-VbrMajorVersion { 13 }
+    . $connectWithSwitch
+    Reset-ConnectCounters
+    $problems = @(Connect-VeeamModules -Vbr -Quiet -Reconnect)
+    Check 'VBR 13: the reconnect works'                 $problems.Count 0
+    Check 'VBR 13: it accepts the local certificate'    $script:vbrForced 'True'
+    Check 'VBR 13: it connects to localhost only'       $script:vbrServer 'localhost'
+    Check 'VBR 13: it ends the old session first'       $script:vbrDisconnects 1
+
+    # VBR 12: never the switch, even if a build had it.
+    function Get-VbrMajorVersion { 12 }
+    Reset-ConnectCounters
+    $problems = @(Connect-VeeamModules -Vbr -Quiet -Reconnect)
+    Check 'VBR 12: the reconnect works'                 $problems.Count 0
+    Check 'VBR 12: it does not force the certificate'   $script:vbrForced 'False'
+    function Get-VbrMajorVersion { 0 }
+    Reset-ConnectCounters
+    $null = @(Connect-VeeamModules -Vbr -Quiet -Reconnect)
+    Check 'unknown VBR version: no forced certificate'  $script:vbrForced 'False'
+    # VBR 13 with a cmdlet that has no such switch: connect as before, without error.
+    function Get-VbrMajorVersion { 13 }
+    . $connectWithoutSwitch
+    Reset-ConnectCounters
+    $problems = @(Connect-VeeamModules -Vbr -Quiet -Reconnect)
+    Check 'no switch on the cmdlet: the reconnect works' $problems.Count 0
+    Check 'no switch on the cmdlet: none is passed'     $script:vbrForced 'False'
+
+    # One try only, unless the services were just started.
+    . $connectWithSwitch
+    Reset-ConnectCounters -Failures 2
+    $problems = @(Connect-VeeamModules -Vbr -Quiet -Reconnect)
+    Check 'without -AfterRestart: one try'              $script:vbrConnects 1
+    Check 'without -AfterRestart: the failure is a problem' ((@($problems) -join ' ') -match '^Connect-VBRServer -Server localhost failed: Failed to connect to Identity service$') 'True'
+    Reset-ConnectCounters -Failures 2
+    $problems = @(Connect-VeeamModules -Vbr -Quiet -Reconnect -AfterRestart)
+    Check 'after a restart: it tries again until it works' $script:vbrConnects 3
+    Check 'after a restart: no problem once it works'   $problems.Count 0
+    Check 'after a restart: old session ended before each try' $script:vbrDisconnects 3
+    # It gives up when the wait is over.
+    $script:VeeamConnectWaitSeconds = 0
+    Reset-ConnectCounters -Failures 99
+    $problems = @(Connect-VeeamModules -Vbr -Quiet -Reconnect -AfterRestart)
+    Check 'after a restart: a wait of 0 means one try'  (($script:vbrConnects -eq 1) -and $problems.Count -eq 1) 'True'
+    $script:VeeamConnectWaitSeconds = 30
+    # A connection that never works: the tries end when the wait is over.
+    $script:neverTries = 0
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $lastError = Invoke-VeeamConnectWithRetry -Name 'never' -WaitSeconds 2 -PauseSeconds 1 -Connect { $script:neverTries++; throw 'still not ready' }
+    $clock.Stop()
+    Check 'the tries end when the wait is over'         (($lastError -eq 'still not ready') -and $script:neverTries -gt 1 -and $clock.Elapsed.TotalSeconds -lt 6) 'True'
+
+    # The VB365 connection gets the same tries.
+    function Connect-VBOServer { [CmdletBinding()] param() $script:vboConnects++; if ($script:vboConnects -le $script:vboFailures) { throw 'The controller is not ready' } }
+    $script:vboConnects = 0; $script:vboDisconnects = 0; $script:vboFailures = 1
+    $problems = @(Connect-VeeamModules -Vb365 -Quiet -Reconnect)
+    Check 'VB365 without -AfterRestart: one try, one problem' (($script:vboConnects -eq 1) -and ((@($problems) -join ' ') -match '^Veeam\.Archiver\.PowerShell \(needs PowerShell 7\.4\.2\+\): The controller is not ready$')) 'True'
+    $script:vboConnects = 0; $script:vboDisconnects = 0; $script:vboFailures = 1
+    $problems = @(Connect-VeeamModules -Vb365 -Quiet -Reconnect -AfterRestart)
+    Check 'VB365 after a restart: it tries again until it works' (($script:vboConnects -eq 2) -and $problems.Count -eq 0 -and $script:vboDisconnects -eq 2) 'True'
+    $script:vboConnects = 0; $script:vboDisconnects = 0; $script:vboFailures = 0
+    $null = @(Connect-VeeamModules -Vb365 -Quiet)
+    Check 'VB365 without -Reconnect: no disconnect'     (($script:vboConnects -eq 1) -and $script:vboDisconnects -eq 0) 'True'
+}
+
+'--- A leftover registry record is named in ActionRequired ---'
+& {
+    foreach ($fn in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -in @('Get-LeftoverRecordAction', 'Join-ActionRequired') }, $true)) {
+        . ([scriptblock]::Create($fn.Extent.Text))
+    }
+    $emOnly = [ordered]@{ StaleEmRecord = 'present'; StaleVeeamOneRecord = '' }
+    Check 'EM leftover: named when an update is due (exit 5)' ((Get-LeftoverRecordAction -Report $emOnly -Code 5) -match '^A leftover Enterprise Manager registry record is on this server \(StaleEmRecord\)\. To remove it, run this script once with -RemoveStaleEnterpriseManagerRecord\.') 'True'
+    Check 'EM leftover: named when nothing is due (exit 0)' ((Get-LeftoverRecordAction -Report $emOnly -Code 0) -match 'RemoveStaleEnterpriseManagerRecord') 'True'
+    Check 'EM leftover: named after a preflight stop (exit 20)' ((Get-LeftoverRecordAction -Report $emOnly -Code 20) -match 'RemoveStaleEnterpriseManagerRecord') 'True'
+    Check 'EM leftover: not when an operator is paged (exit 40)' (Get-LeftoverRecordAction -Report $emOnly -Code 40) ''
+    Check 'EM leftover: not when an operator is paged now (exit 50)' (Get-LeftoverRecordAction -Report $emOnly -Code 50) ''
+    Check 'EM leftover: a removed record needs no step' (Get-LeftoverRecordAction -Report ([ordered]@{ StaleEmRecord = 'removed; backup C:\ProgramData\VeeamPgUpdate\logs\x.reg'; StaleVeeamOneRecord = '' }) -Code 0) ''
+    $voneOnly = [ordered]@{ StaleEmRecord = ''; StaleVeeamOneRecord = 'present' }
+    Check 'Veeam ONE leftover: named'                   ((Get-LeftoverRecordAction -Report $voneOnly -Code 0) -match '^A leftover Veeam ONE registry record is on this server \(StaleVeeamOneRecord\)\. To remove it, run this script once with -RemoveStaleVeeamOneRecord\.') 'True'
+    $both = Get-LeftoverRecordAction -Report ([ordered]@{ StaleEmRecord = 'present'; StaleVeeamOneRecord = 'present' }) -Code 6
+    Check 'both leftovers: both named'                  (($both -match 'RemoveStaleEnterpriseManagerRecord') -and ($both -match 'RemoveStaleVeeamOneRecord')) 'True'
+    Check 'no leftover: no step'                        (Get-LeftoverRecordAction -Report ([ordered]@{ StaleEmRecord = ''; StaleVeeamOneRecord = '' }) -Code 0) ''
+    Check 'an early stop with no fields: no step'       (Get-LeftoverRecordAction -Report ([ordered]@{}) -Code 20) ''
+    # A failed removal: Detail says why; the step would send the operator round in a loop.
+    Check 'EM removal failed: no step for EM'           (Get-LeftoverRecordAction -Report ([ordered]@{ StaleEmRecord = 'present'; StaleVeeamOneRecord = ''; IssueCode = 'STALE_EM_RECORD_REMOVE_FAILED' }) -Code 20) ''
+    Check 'Veeam ONE removal failed: no step for Veeam ONE' (Get-LeftoverRecordAction -Report ([ordered]@{ StaleEmRecord = ''; StaleVeeamOneRecord = 'present'; IssueCode = 'STALE_VEEAM_ONE_RECORD_REMOVE_FAILED' }) -Code 20) ''
+    $emFailedVoneLeft = Get-LeftoverRecordAction -Report ([ordered]@{ StaleEmRecord = 'present'; StaleVeeamOneRecord = 'present'; IssueCode = 'STALE_EM_RECORD_REMOVE_FAILED' }) -Code 20
+    Check 'EM removal failed: the Veeam ONE step stays' (($emFailedVoneLeft -notmatch 'RemoveStaleEnterpriseManagerRecord') -and ($emFailedVoneLeft -match 'RemoveStaleVeeamOneRecord')) 'True'
+    Check 'join: None becomes the step'                 (Join-ActionRequired -Action 'None' -Step 'X.') 'X.'
+    Check 'join: no action becomes the step'            (Join-ActionRequired -Action '' -Step 'X.') 'X.'
+    Check 'join: another action is followed by Also:'   (Join-ActionRequired -Action 'Schedule and verify a server reboot.' -Step 'X.') 'Schedule and verify a server reboot. Also: X.'
+    Check 'join: a booked restart loses its None.'      (Join-ActionRequired -Action 'None. The server restarts at 03:00:00; after it is back, rerun the audit to confirm.' -Step 'X.') 'The server restarts at 03:00:00; after it is back, rerun the audit to confirm. Also: X.'
+}
+$completeRunForLeftover = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Complete-Run' }, $true))[0].Extent.Text
+Check 'Complete-Run asks for the leftover step'     ($completeRunForLeftover -match [regex]::Escape('$leftoverAction = Get-LeftoverRecordAction -Report $script:Report -Code $finalCode')) 'True'
+Check 'the leftover step is joined to ActionRequired' ($completeRunForLeftover -match [regex]::Escape('$script:Report.ActionRequired = Join-ActionRequired -Action "$($script:Report.ActionRequired)" -Step $leftoverAction')) 'True'
+Check 'the leftover step comes after the final ActionRequired' ($completeRunForLeftover.IndexOf('$leftoverAction = Get-LeftoverRecordAction') -gt $completeRunForLeftover.IndexOf('if (-not $script:Report.ActionRequired) { $script:Report.ActionRequired = Get-RmmActionForExitCode $finalCode }')) 'True'
+Check 'the leftover helpers exist before Complete-Run' ($scriptText.IndexOf('function Get-LeftoverRecordAction') -gt 0 -and $scriptText.IndexOf('function Join-ActionRequired') -gt 0 -and $scriptText.IndexOf('function Get-LeftoverRecordAction') -lt $scriptText.IndexOf('function Complete-Run') -and $scriptText.IndexOf('function Join-ActionRequired') -lt $scriptText.IndexOf('function Complete-Run')) 'True'
+
+'--- The VBR major version, read from the Veeam Backup Service file ---'
+& {
+    foreach ($fn in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Get-VbrMajorVersion' }, $true)) {
+        . ([scriptblock]::Create($fn.Extent.Text))
+    }
+    function Get-RegValue { param([string] $Key, [string] $Name) $script:fakeCorePath }
+    function Get-FileVersionSafe { param([string] $Path) if ($Path -like '*Veeam.Backup.Service.exe') { $script:fakeServiceVersion } else { $script:fakeDllVersion } }
+    $script:fakeCorePath = 'C:\Program Files\Veeam\Backup and Replication\Backup'
+    $script:fakeServiceVersion = '13.0.1.180'; $script:fakeDllVersion = $null
+    Check 'version 13.0.1.180 is 13'                    (Get-VbrMajorVersion) 13
+    $script:fakeServiceVersion = '12.3.2.3617'
+    Check 'version 12.3.2.3617 is 12'                   (Get-VbrMajorVersion) 12
+    $script:fakeServiceVersion = $null; $script:fakeDllVersion = '13.0.0.4967'
+    Check 'the deployment DLL is the fallback'          (Get-VbrMajorVersion) 13
+    $script:fakeDllVersion = $null
+    Check 'no version readable: 0'                      (Get-VbrMajorVersion) 0
+    $script:fakeCorePath = $null
+    Check 'VBR not installed: 0'                        (Get-VbrMajorVersion) 0
+}
+$waitAt = $scriptText.IndexOf('$script:VeeamConnectWaitSeconds = 600')
+Check 'the shipped wait after a restart is 10 minutes' ($waitAt -gt 0) 'True'
+Check 'the pre-change check keeps one try'          ($scriptText -match [regex]::Escape('Connect-VeeamModules -Vbr:$Vbr -Vb365:$Vb365 -Quiet -Reconnect:$Reconnect)')) 'True'
+Check 'NATS post-start reconnect waits'             ($scriptText -match [regex]::Escape('$postStartModuleProblems = @(Connect-VeeamModules -Vb365 -Quiet -Reconnect -AfterRestart)')) 'True'
+Check 'NATS rollback reconnect waits'               ($scriptText -match [regex]::Escape('$vbReconnect = @(Connect-VeeamModules -Vb365 -Quiet -Reconnect -AfterRestart)')) 'True'
+$rollbackBody = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Invoke-Rollback' }, $true))[0].Extent.Text
+$rollbackVbrAt = $rollbackBody.IndexOf('$vbrReconnect = @(Connect-VeeamModules -Vbr -Quiet -Reconnect -AfterRestart)')
+Check 'rollback reconnects VBR after the restart'   ($rollbackVbrAt -gt $rollbackBody.IndexOf('Restore-VeeamServiceState -AllowStops:$false')) 'True'
+Check 'rollback reconnects VBR before the jobs'     ($rollbackVbrAt -gt 0 -and $rollbackVbrAt -lt $rollbackBody.IndexOf('Enable-VeeamJobById')) 'True'
+Check 'rollback reconnects VBR only after a restart' ($rollbackBody -match [regex]::Escape("if (`$script:Stage -eq 'SERVICES_STOPPED' -and `$problems.Count -eq 0 -and `"`$(`$script:Report.VeeamProducts)`" -match '(^|\+)VBR(`$|\+)') {")) 'True'
+Check 'a failed rollback reconnect does not stop the jobs' ($rollbackBody -match [regex]::Escape('Trying to turn the jobs back on anyway.')) 'True'
 $recoverBody = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Invoke-ExplicitRecovery' }, $true))[0].Extent.Text
 $moduleCheckAt = $recoverBody.IndexOf('Test-VeeamModuleImport')
 Check 'module check comes before NATS is put back' ($moduleCheckAt -gt 0 -and $moduleCheckAt -lt $recoverBody.IndexOf('Restore-NatsInstallation')) 'True'

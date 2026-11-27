@@ -30,6 +30,7 @@ Read these report fields before you do anything else:
 | A leftover `CHANGES-IN-PROGRESS.marker` blocks the run (`PRIOR_RUN_INCOMPLETE`) | [Runs that changed nothing](#runs-that-changed-nothing), then [The CHANGES-IN-PROGRESS marker](#the-changes-in-progress-marker) |
 | PostgreSQL marker at `VERIFIED`, Veeam services running, `-Recover` only reports | [Closing out an earlier run by hand](#closing-out-an-earlier-run-by-hand) |
 | Exit 40, `Stage=VERIFIED` | [Exit 40, Stage=VERIFIED](#exit-40-stageverified) |
+| `UnhealthyServices` says "Failed to connect to Identity service" (VBR 13) | ["Failed to connect to Identity service" (VBR 13)](#failed-to-connect-to-identity-service-vbr-13) |
 | Exit 40, `Stage=JOBS_DISABLED` or `SERVICES_STOPPED` | [Exit 40, Stage=JOBS_DISABLED or SERVICES_STOPPED](#exit-40-stagejobs_disabled-or-services_stopped) |
 | Exit 50 | [Exit 50](#exit-50) |
 | `WshStatus=LEFT_ON` | [WshStatus=LEFT_ON](#wshstatusleft_on) |
@@ -109,6 +110,33 @@ What the script does:
 - **Schedules:** it leaves affected schedules disabled, to prevent jobs running against an unhealthy stack.
 - **RMM summary** names the problem and the disabled schedules.
 - **No reboot:** it never reboots in this case.
+
+### "Failed to connect to Identity service" (VBR 13)
+
+`SERVICES_UNHEALTHY_JOBS_DISABLED` can name `Connect-VBRServer -Server localhost failed:
+Failed to connect to Identity service`. The run could not connect to Veeam again after
+it restarted the services. On a VBR 13 server, two things can cause this:
+
+- **The certificate prompt.** VBR 13 asks "Do you trust this certificate?" the first time
+  an account connects. An RMM run cannot answer it.
+- **A slow start.** The Identity Service starts inside the Veeam Backup Service, and can
+  accept connections minutes after the service shows Running.
+
+Script copies from 2026-11-27 on handle both:
+
+- On VBR 13 or later, the run accepts the certificate of this server's own Veeam Backup
+  Service for that local connection (`-ForceAcceptTlsCertificate`). VBR 12 connects as
+  before.
+- When the run has just started the Veeam services, its reconnect gives each connection
+  (VBR and VB365) up to 10 minutes, with a try every 15 seconds. Every other connection
+  tries once.
+
+What to do, whichever copy ran:
+
+1. Check that `Connect-VBRServer -Server localhost` works again as SYSTEM.
+2. Close the run out by hand: see
+   [Closing out an earlier run by hand](#closing-out-an-earlier-run-by-hand).
+3. If the run was from an older copy, give your RMM the current copy.
 
 ## Exit 40, Stage=JOBS_DISABLED or SERVICES_STOPPED
 

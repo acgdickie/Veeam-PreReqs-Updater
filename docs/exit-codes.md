@@ -16,7 +16,7 @@ The process exit code is the RMM contract. Point RMM automation and alerting at 
 
 | Code | Meaning | Action |
 |---|---|---|
-| `0` | Healthy, with no outstanding RMM action. Also returned for the named outcomes listed under this table | None. After a booked restart, rerun audit to confirm |
+| `0` | Healthy, and nothing is due. Also returned for the named outcomes listed under this table | None, unless `ActionRequired` names a leftover registry record or `NatsStatus=HASH_CONFLICT`. After a booked restart, rerun audit to confirm |
 | `5` | Supported branch: audit found a PostgreSQL minor update or a NATS update. One more case: see below | Schedule `-Install` through the rollout ring |
 | `6` | Supported branch: update succeeded; reboot required | Schedule and verify a reboot |
 | `7` | PostgreSQL branch is EOL | Open or maintain a major-version migration ticket |
@@ -105,7 +105,7 @@ These report fields are the RMM-readable issue note for any action-bearing resul
 
 | Field | What it tells you |
 |---|---|
-| `StaleEmRecord` | `present`: a leftover Enterprise Manager registry key was found. `removed; backup <path>`: `-RemoveStaleEnterpriseManagerRecord` deleted it |
+| `StaleEmRecord` | `present`: a leftover Enterprise Manager registry key was found. `ActionRequired` then names the switch that removes it, except on exit `40` and `50`. `removed; backup <path>`: `-RemoveStaleEnterpriseManagerRecord` deleted it |
 | `StaleVeeamOneRecord` | The same, for a leftover Veeam ONE key and `-RemoveStaleVeeamOneRecord` |
 | `WshStatus` | What happened to Windows Script Host. See [Windows Script Host and Veeam hardening](windows-script-host.md) |
 | `ServicesStarted` | Stopped automatic Veeam services that the run started to rescue a failed configuration backup |
